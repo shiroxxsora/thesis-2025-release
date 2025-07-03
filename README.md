@@ -24,10 +24,13 @@ thesis-2025-release/
 
 ## Установка окружения (Linux, Python 3.10)
 
-```bash
-conda env create -f environment.yml
-conda activate thesis-2025-env
-```
+1. Скачайте и установите [Miniconda](https://docs.conda.io/en/latest/miniconda.html) или [Anaconda](https://www.anaconda.com/products/distribution).
+2. Откройте терминал и перейдите в папку проекта.
+3. Выполните команды:
+   ```bash
+   conda env create -f environment.yml
+   conda activate thesis-2025-env
+   ```
 
 ## Решение проблем с установкой окружения
 
