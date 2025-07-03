@@ -2,14 +2,14 @@
 
 Программное обеспечение для автоматического обнаружения и анализа нарушений землепользования на основе анализа спутниковых/аэрофотоснимков (GeoTIFF) с использованием машинного обучения (Detectron2) и кадастровых данных.
 
-## Структура папки release
+## Структура проекта
 
 ```
-release/
+thesis-2025-release/
   ├── README.md                    # Эта инструкция
-  ├── requirements.txt             # Зависимости Python
-  ├── geotiff_processor.py         # Основной скрипт для инференса (распознавания)
-  ├── fine_tuning_280625.py        # Скрипт для дообучения на последних датасетах
+  ├── environment.yml              # Conda окружение
+  ├── geotiff_processor.py         # Основной скрипт для инференса
+  ├── fine_tuning_280625.py        # Скрипт для дообучения
   ├── finetune_model.py            # Базовый скрипт дообучения
   ├── train_model.py               # Полный скрипт обучения с нуля
   ├── models/
@@ -22,43 +22,51 @@ release/
       └── ЗУ все2.MID              # Кадастровые атрибуты (MID формат)
 ```
 
-## Установка зависимостей
-
-### 1. Python и системные требования
-- Python 3.8–3.10 (рекомендуется 3.9)
-- CUDA 11.8+ (для GPU, опционально)
-- Оперативная память: 16+ ГБ (для больших GeoTIFF)
-- Место на диске: 10+ ГБ (включая модель и зависимости)
-
-### 2. Установка PyTorch
-**ВАЖНО: Установите PyTorch ПЕРВЫМ!**
-
-Перейдите на https://pytorch.org/get-started/locally/ и выберите вашу конфигурацию:
+## Установка окружения (Linux, Python 3.10)
 
 ```bash
-# Для CUDA 12.1
-pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu121
-
-# Для CUDA 11.8
-pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu118
-
-# Для CPU (медленно, не рекомендуется)
-pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1
+conda env create -f environment.yml
+conda activate thesis-2025-env
 ```
 
-### 3. Установка остальных зависимостей
+## Решение проблем с установкой окружения
+
+Если conda застревает на этапе "Solving environment" или возникают другие проблемы с зависимостями, используйте следующие рекомендации:
+
+### Вариант 1: Очистить кэш conda
 ```bash
-pip install -r requirements.txt
+conda clean --all
+conda env create -f environment.yml
 ```
 
-**На Windows:** Если возникают проблемы с GDAL, скачайте wheel файл с https://www.lfd.uci.edu/~gohlke/pythonlibs/#gdal
-
-### 4. Проверка установки
+### Вариант 2: Поэтапная установка (рекомендуется при сложных ошибках)
 ```bash
-python -c "import torch; print('PyTorch:', torch.__version__)"
-python -c "import detectron2; print('Detectron2: OK')"
-python -c "import rasterio; print('GDAL/Rasterio: OK')"
+# Прервать процесс (Ctrl+C)
+conda create -n thesis-2025-env python=3.10 -y
+conda activate thesis-2025-env
+conda install gdal rasterio shapely geopandas -c conda-forge -y
+conda install numpy scipy opencv matplotlib pillow pyyaml tqdm cython pip -c conda-forge -y
+pip install ninja pycocotools
+pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu118
+pip install torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu118
+pip install torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu118
+pip install git+https://github.com/facebookresearch/detectron2.git
 ```
+
+
+### Проверка установки
+```bash
+conda activate thesis-2025-env
+python -c "import torch; print(torch.__version__); print(torch.cuda.is_available())"
+python -c "import detectron2; print(detectron2.__version__)"
+python -c "import rasterio, geopandas; print('Геопакеты установлены')"
+```
+
+
+### Рекомендации
+1. Очищайте кэш conda при проблемах: `conda clean --all`
+2. Устанавливайте PyTorch отдельно от других пакетов
+5. Устанавливайте геопакеты через conda-forge
 
 ## Использование
 
@@ -164,35 +172,6 @@ score_thresh = 0.5
 min_violation_area_sqm = 1.5
 ```
 
-## Решение проблем
-
-### PyTorch/CUDA
-```bash
-# Проверить версию CUDA
-nvidia-smi
-
-# Переустановить PyTorch под нужную CUDA
-pip uninstall torch torchvision torchaudio
-# Затем установить заново по инструкции выше
-```
-
-### GDAL (Windows)
-```bash
-# Если pip install gdal не работает
-pip install GDAL-3.4.3-cp39-cp39-win_amd64.whl
-# (скачать wheel с https://www.lfd.uci.edu/~gohlke/pythonlibs/)
-```
-
-### Память
-- Уменьшите `chunk_size` до 3000-4000
-- Закройте другие программы
-- Используйте swap/виртуальную память
-
-### Файлы не найдены
-- Убедитесь, что файлы лежат в правильных папках
-- Используйте абсолютные пути
-- Проверьте права доступа к файлам
-
 ## Результаты анализа
 
 ### Файл violation_analysis.json содержит:
@@ -222,98 +201,3 @@ pip install GDAL-3.4.3-cp39-cp39-win_amd64.whl
 - RAM: 32+ ГБ
 - GPU: NVIDIA RTX с 8+ ГБ VRAM
 - SSD: 50+ ГБ
-
-## Описание параметров и переменных
-
-Все основные параметры настраиваются в начале файла `geotiff_to_shp.py`:
-
-- **INPUT_TIFF** — путь к входному GeoTIFF-файлу.
-- **MODEL_CONFIG** — путь к конфигу нейросети.
-- **MODEL_WEIGHTS** — путь к файлу весов модели.
-- **OUTPUT_SHP** — путь для сохранения итогового Shapefile.
-- **OUTPUT_KML** — путь для сохранения итогового KML.
-- **SCORE_THRESH** — порог уверенности нейросети (0.0-1.0).
-- **MIN_POLY_POINTS** — минимальное число точек в полигоне (упрощение).
-- **MAX_POLY_POINTS** — максимальное число точек в полигоне (упрощение).
-- **CHUNK_SIZE** — размер чанка для обработки больших изображений.
-- **OVERLAP** — перекрытие между чанками.
-
-### Как контролировать детализацию полигонов
-
-- Для более гладких (простых) полигонов уменьшите `MAX_POLY_POINTS`.
-- Для более точных (детализированных) полигонов увеличьте `MAX_POLY_POINTS`.
-- `MIN_POLY_POINTS` не рекомендуется ставить меньше 3 (иначе не получится полигон).
-
-## Визуальные схемы процессов
-
-(Вставьте сюда схемы из предыдущих сообщений — например, в виде PNG или SVG, либо как текстовые блоки Mermaid)
-
-## FAQ
-
-- **Как изменить количество точек в полигоне?**  
-  Измените параметры `MIN_POLY_POINTS` и `MAX_POLY_POINTS` в начале файла `geotiff_to_shp.py`.
-
-- **Как получить KML?**  
-  KML-файл формируется автоматически при запуске скрипта и сохраняется в папку `output/`.
-
-- **Что делать, если мало объектов на выходе?**  
-  Уменьшите `SCORE_THRESH` (например, до 0.3).
-
-- **Что делать, если скрипт не видит файлы?**  
-  Проверьте пути к файлам в переменных в начале скрипта.
-
-## Алгоритмы работы (схемы)
-
-### 1. Обучение модели с нуля
-
-1. **Подготовьте датасет**:  
-   - Соберите все изображения в одну папку (например, `Combined_Dataset/images/`).
-   - Подготовьте файл аннотаций в формате COCO (например, `Combined_Dataset/annotations.json`).
-
-2. **Запустите обучение**:  
-   - Откройте терминал в папке `prerelease`.
-   - Выполните команду:  
-     `python train_model.py`
-
-3. **Результат**:  
-   - После завершения обучения файл весов модели будет сохранён, например, в `output_maskrcnn_r50/model_final.pth`.
-
----
-
-### 2. Дообучение (fine-tuning) существующей модели
-
-1. **Подготовьте новый датасет**:  
-   - Создайте новую папку с изображениями и аннотациями (например, `dataset_280625/`).
-
-2. **Запустите дообучение**:  
-   - Убедитесь, что у вас есть файл весов предыдущей модели (`model_final.pth`).
-   - Откройте терминал в папке `prerelease`.
-   - Выполните команду:  
-     `python fine_tuning_280625.py`
-
-3. **Результат**:  
-   - После завершения дообучения обновлённый файл весов будет сохранён в папке, например, `output/finetuned_model_r101_280625/model_final.pth`.
-
----
-
-### 3. Инференс и экспорт результатов
-
-1. **Подготовьте входные данные**:  
-   - Поместите ваш GeoTIFF-файл в папку `geotiffs/` или укажите путь к нему в переменной `INPUT_TIFF` в начале файла `geotiff_to_shp.py`.
-   - Убедитесь, что путь к файлу весов модели (`MODEL_WEIGHTS`) указан верно.
-
-2. **Запустите инференс**:  
-   - Откройте терминал в папке `prerelease`.
-   - Выполните команду:  
-     `python geotiff_to_shp.py`
-
-3. **Результат**:  
-   - В папке `output/` появятся файлы:
-     - `polygons_from_mask.shp` — полигоны для QGIS/ArcGIS.
-     - `polygons_from_mask.kml` — полигоны для Google Earth.
-
----
-
-**Примечание:**  
-Все параметры (пути к файлам, пороги, детализация полигонов и др.) настраиваются в начале соответствующих скриптов.  
-Подробное описание переменных — в разделе "Описание параметров и переменных".

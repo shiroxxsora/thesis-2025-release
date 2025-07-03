@@ -1,0 +1,27 @@
+name: thesis-2025-env
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - numpy
+  - scipy
+  - opencv
+  - gdal
+  - rasterio
+  - shapely
+  - matplotlib
+  - pillow
+  - pyyaml
+  - tqdm
+  - geopandas
+  - cython
+  - pip
+  - pip:
+      - ninja
+      - pycocotools
+      - torch==2.7.1 --index-url https://download.pytorch.org/whl/cu118
+      - torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu118
+      - torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu118
+      - git+https://github.com/facebookresearch/detectron2.git
