@@ -9,6 +9,7 @@ thesis-2025-release/
   ├── README.md                    # Эта инструкция
   ├── environment.yml              # Conda окружение
   ├── geotiff_processor.py         # Основной скрипт для инференса
+  ├── geotiff_to_shp.py            # Основной скрипт для инференса и экспорта в shp file
   ├── fine_tuning_280625.py        # Скрипт для дообучения
   ├── finetune_model.py            # Базовый скрипт дообучения
   ├── train_model.py               # Полный скрипт обучения с нуля
