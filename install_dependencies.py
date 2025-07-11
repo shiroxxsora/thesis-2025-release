@@ -25,6 +25,8 @@ def main():
         "gdal",
         "opencv-python",
         "numpy",
+        "pandas",
+        "openpyxl",
         "torch",
         "torchvision"
     ]
