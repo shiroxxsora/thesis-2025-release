@@ -17,6 +17,9 @@ dependencies:
   - tqdm
   - geopandas
   - cython
+  - pandas
+  - reportlab
+  - openpyxl
   - pip
   - pip:
       - ninja
