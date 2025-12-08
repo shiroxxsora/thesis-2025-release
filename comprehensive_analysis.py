@@ -31,6 +31,7 @@ from shapely.ops import transform as shapely_transform
 from osgeo import gdal, ogr, osr
 from osgeo.gdal import UseExceptions
 import geopandas as gpd
+from shapely.geometry import shape
 
 # Detectron2
 from detectron2.config import get_cfg
@@ -53,7 +54,13 @@ class ComprehensiveAnalyzer:
             'model_input_size': 1024,
             'score_threshold': 0.3,
             'min_polygon_area': 100.0,
-            'min_violation_area': 0.5
+            'min_violation_area': 0.5,
+            'simplify_tolerance_m': 0.5,
+            'cv_eps_factor': 0.004,
+            # Пороги привязки
+            'binding_min_intersection_ratio': 0.1,  # доля площади пересечения от площади нарушения
+            'binding_boundary_buffer_m': 3.0,       # буфер для касания границы участка
+            'binding_max_nearest_distance_m': 25.0  # максимум для привязки по ближайшей границе
         }
         
         self.results = {
@@ -96,8 +103,8 @@ class ComprehensiveAnalyzer:
             area = cv2.contourArea(contour)
             if area < min_area:
                 continue
-                
-            epsilon = 0.002 * cv2.arcLength(contour, True)
+            
+            epsilon = self.config.get('cv_eps_factor', 0.004) * cv2.arcLength(contour, True)
             approx = cv2.approxPolyDP(contour, epsilon, True)
             
             if len(approx) >= 3:
@@ -329,6 +336,12 @@ class ComprehensiveAnalyzer:
                         
                         if len(geo_coords) >= 3:
                             poly = Polygon(geo_coords)
+                            tol = float(self.config.get('simplify_tolerance_m', 0.5))
+                            if tol > 0:
+                                try:
+                                    poly = poly.simplify(tol, preserve_topology=True)
+                                except Exception:
+                                    pass
                             if poly.is_valid and poly.area > 0:
                                 # Каждая маска = отдельный инстанс (БЕЗ объединения!)
                                 instance = {
@@ -438,27 +451,27 @@ class ComprehensiveAnalyzer:
                     if not cadastral_number:
                         cadastral_number = f"Parcel_{len(cadastral_objects)}"
                     if geom_clone.GetGeometryType() == ogr.wkbPolygon:
-                        poly = Polygon(json.loads(geom_clone.ExportToJson())['coordinates'][0])
-                        if poly.is_valid and poly.area > 0:
+                        shp = shape(json.loads(geom_clone.ExportToJson()))
+                        if shp.is_valid and shp.area > 0:
                             # Фильтрация по пересечению с bbox изображения
-                            if raster_bbox is None or poly.intersects(raster_bbox):
+                            if raster_bbox is None or shp.intersects(raster_bbox):
                                 cadastral_objects.append({
-                                    'geometry': poly,
+                                    'geometry': shp,
                                     'cadastral_number': cadastral_number,
-                                    'area_sqm': poly.area,
-                                    'centroid': poly.centroid.coords[0]
+                                    'area_sqm': shp.area,
+                                    'centroid': shp.centroid.coords[0]
                                 })
                     elif geom_clone.GetGeometryType() == ogr.wkbMultiPolygon:
                         for i in range(geom_clone.GetGeometryCount()):
                             subgeom = geom_clone.GetGeometryRef(i)
-                            poly = Polygon(json.loads(subgeom.ExportToJson())['coordinates'][0])
-                            if poly.is_valid and poly.area > 0:
-                                if raster_bbox is None or poly.intersects(raster_bbox):
+                            shp = shape(json.loads(subgeom.ExportToJson()))
+                            if shp.is_valid and shp.area > 0:
+                                if raster_bbox is None or shp.intersects(raster_bbox):
                                     cadastral_objects.append({
-                                        'geometry': poly,
+                                        'geometry': shp,
                                         'cadastral_number': f"{cadastral_number}_part_{i}",
-                                        'area_sqm': poly.area,
-                                        'centroid': poly.centroid.coords[0]
+                                        'area_sqm': shp.area,
+                                        'centroid': shp.centroid.coords[0]
                                     })
                 except Exception as e:
                     continue
@@ -596,19 +609,19 @@ class ComprehensiveAnalyzer:
                     
                     # Обрабатываем геометрию
                     if geom_clone.GetGeometryType() == ogr.wkbPolygon:
-                        poly = Polygon(json.loads(geom_clone.ExportToJson())['coordinates'][0])
-                        if poly.is_valid and poly.area > 0:
-                            if raster_bbox is None or poly.intersects(raster_bbox):
+                        shp = shape(json.loads(geom_clone.ExportToJson()))
+                        if shp.is_valid and shp.area > 0:
+                            if raster_bbox is None or shp.intersects(raster_bbox):
                                 # Вычисляем координаты углов участка
-                                bounds = poly.bounds
-                                exterior_coords = list(poly.exterior.coords)
+                                bounds = shp.bounds
+                                exterior_coords = list(shp.exterior.coords)
                                 
                                 cadastral_objects.append({
-                                    'geometry': poly,
+                                    'geometry': shp,
                                     'cadastral_number': cadastral_number,
                                     'object_id': object_id,
-                                    'area_sqm': poly.area,
-                                    'centroid': poly.centroid.coords[0],
+                                    'area_sqm': shp.area,
+                                    'centroid': shp.centroid.coords[0],
                                     'bounds': bounds,
                                     'exterior_coords': exterior_coords,
                                     'attributes': attributes
@@ -617,18 +630,18 @@ class ComprehensiveAnalyzer:
                     elif geom_clone.GetGeometryType() == ogr.wkbMultiPolygon:
                         for i in range(geom_clone.GetGeometryCount()):
                             subgeom = geom_clone.GetGeometryRef(i)
-                            poly = Polygon(json.loads(subgeom.ExportToJson())['coordinates'][0])
-                            if poly.is_valid and poly.area > 0:
-                                if raster_bbox is None or poly.intersects(raster_bbox):
-                                    bounds = poly.bounds
-                                    exterior_coords = list(poly.exterior.coords)
+                            shp = shape(json.loads(subgeom.ExportToJson()))
+                            if shp.is_valid and shp.area > 0:
+                                if raster_bbox is None or shp.intersects(raster_bbox):
+                                    bounds = shp.bounds
+                                    exterior_coords = list(shp.exterior.coords)
                                     
                                     cadastral_objects.append({
-                                        'geometry': poly,
+                                        'geometry': shp,
                                         'cadastral_number': f"{cadastral_number}_part_{i}",
                                         'object_id': f"{object_id}_part_{i}",
-                                        'area_sqm': poly.area,
-                                        'centroid': poly.centroid.coords[0],
+                                        'area_sqm': shp.area,
+                                        'centroid': shp.centroid.coords[0],
                                         'bounds': bounds,
                                         'exterior_coords': exterior_coords,
                                         'attributes': attributes
@@ -681,6 +694,14 @@ class ComprehensiveAnalyzer:
                 try:
                     poly = Polygon(geo_coords)
                     if poly.is_valid and poly.area > 0:
+                        # Упрощаем геометрию нарушения
+                        tol = float(self.config.get('simplify_tolerance_m', 0.5))
+                        if tol > 0:
+                            try:
+                                poly = poly.simplify(tol, preserve_topology=True)
+                            except Exception:
+                                pass
+
                         violation = {
                             'geometry': poly,
                             'violation_area': contour_area_sqm,
@@ -739,6 +760,7 @@ class ComprehensiveAnalyzer:
         print("Создание пространственного индекса для кадастровых участков...")
         cadastral_geometries = [cadastral['geometry'] for cadastral in cadastral_objects]
         cadastral_tree = STRtree(cadastral_geometries)
+        geom_id_to_index = {id(g): i for i, g in enumerate(cadastral_geometries)}
         
         # Анализируем каждый отдельный инстанс
         for obj_idx, obj in enumerate(detected_objects):
@@ -749,7 +771,22 @@ class ComprehensiveAnalyzer:
             remaining_poly = obj_poly  # Начинаем с полного объекта
             
             # Находим пересекающиеся кадастровые участки
-            intersecting_cadastrals = cadastral_tree.query(obj_poly)
+            try:
+                q = cadastral_tree.query(obj_poly)
+            except Exception:
+                q = []
+            intersecting_cadastrals: List[int] = []
+            if q is not None:
+                try:
+                    if len(q) > 0:
+                        first = q[0]
+                        if isinstance(first, (int, np.integer)):
+                            intersecting_cadastrals = [int(i) for i in q]
+                        else:
+                            intersecting_cadastrals = [geom_id_to_index.get(id(g)) for g in q]
+                            intersecting_cadastrals = [i for i in intersecting_cadastrals if i is not None]
+                except TypeError:
+                    pass
             intersecting_cadastral_objects = [cadastral_objects[idx] for idx in intersecting_cadastrals]
             
             # Вычитаем все пересекающиеся кадастровые участки
@@ -758,15 +795,12 @@ class ComprehensiveAnalyzer:
                 cadastral_poly = cadastral['geometry']
                 
                 if remaining_poly.intersects(cadastral_poly):
-                    # Вычитаем кадастровый участок из оставшейся части объекта
                     difference = remaining_poly.difference(cadastral_poly)
                     
                     if difference.is_empty:
-                        # Объект полностью покрыт кадастровым участком
                         remaining_poly = None
                         break
                     else:
-                        # Обновляем оставшуюся часть
                         remaining_poly = difference
             
             # Если осталась часть объекта после вычитания всех кадастровых участков
@@ -795,27 +829,123 @@ class ComprehensiveAnalyzer:
                     
                     for sub_part in sub_parts:
                         if sub_part.area > self.config['min_violation_area']:
-                            # Находим ближайший кадастровый участок (улучшенный алгоритм)
+                            # Улучшенная логика привязки нарушений к кадастровым участкам
+                            v_centroid = sub_part.centroid
                             closest_cadastral = None
                             min_distance = float('inf')
+                            binding_method = "unknown"
                             
-                            # Сначала ищем среди пересекающихся участков (они более релевантны)
-                            for cadastral in intersecting_cadastral_objects:
-                                distance = sub_part.distance(cadastral['geometry'])
-                                if distance < min_distance:
-                                    min_distance = distance
-                                    closest_cadastral = cadastral
+                            # 1) Приоритет: максимальное пересечение по площади + метрика качества
+                            best_intersection_area = 0.0
+                            best_candidate = None
+                            best_quality_score = 0.0
                             
-                            # Если среди пересекающихся не нашли или расстояние большое,
-                            # ищем среди всех участков
-                            if min_distance > 50.0:  # 50 метров - порог
-                                for cadastral in cadastral_objects:
-                                    if cadastral not in intersecting_cadastral_objects:  # Исключаем уже проверенные
-                                        distance = sub_part.distance(cadastral['geometry'])
+                            for cad in cadastral_objects:
+                                try:
+                                    if not sub_part.intersects(cad['geometry']):
+                                        continue
+                                    intersection = sub_part.intersection(cad['geometry'])
+                                    if intersection.is_empty:
+                                        continue
+                                    inter_area = intersection.area
+                                    inter_ratio = inter_area / max(sub_part.area, 1e-9)
+                                    
+                                    if inter_ratio >= self.config['binding_min_intersection_ratio']:
+                                        ccx, ccy = cad.get('centroid', (None, None))
+                                        if ccx is not None and ccy is not None:
+                                            centroid_dist = math.hypot(v_centroid.x - ccx, v_centroid.y - ccy)
+                                            
+                                            quality_score = (
+                                                inter_ratio * 0.7 +
+                                                (1.0 / (1.0 + centroid_dist / 100)) * 0.2 +
+                                                (inter_area / max(cad.get('area_sqm', 1), 1)) * 0.1
+                                            )
+                                            
+                                            if quality_score > best_quality_score:
+                                                best_quality_score = quality_score
+                                                best_intersection_area = inter_area
+                                                best_candidate = cad
+                                except Exception:
+                                    continue
+
+                            if best_candidate is not None:
+                                closest_cadastral = best_candidate
+                                binding_method = f"max_intersection_quality={best_quality_score:.3f}, area={best_intersection_area:.2f}m2"
+                                ccx, ccy = closest_cadastral.get('centroid', (None, None))
+                                if ccx is not None and ccy is not None:
+                                    min_distance = math.hypot(v_centroid.x - ccx, v_centroid.y - ccy)
+                            
+                            # 2) Фолбэк: центроид нарушения внутри участка (если нет значимых пересечений)
+                            if closest_cadastral is None:
+                                for cad in cadastral_objects:
+                                    try:
+                                        if cad['geometry'].contains(v_centroid):
+                                            closest_cadastral = cad
+                                            binding_method = "centroid_inside"
+                                            ccx, ccy = cad.get('centroid', (None, None))
+                                            if ccx is not None and ccy is not None:
+                                                min_distance = math.hypot(v_centroid.x - ccx, v_centroid.y - ccy)
+                                            break
+                                    except Exception:
+                                        continue
+                            
+                            # 3) Близость к границе участка + направление к центроиду
+                            if closest_cadastral is None and self.config['binding_boundary_buffer_m'] > 0:
+                                best_distance = float('inf')
+                                best_score = float('inf')
+                                best_candidate = None
+                                
+                                for cad in cadastral_objects:
+                                    try:
+                                        distance_to_boundary = sub_part.distance(cad['geometry'])
+                                        if distance_to_boundary <= self.config['binding_boundary_buffer_m']:
+                                            ccx, ccy = cad.get('centroid', (None, None))
+                                            if ccx is not None and ccy is not None:
+                                                centroid_distance = math.hypot(v_centroid.x - ccx, v_centroid.y - ccy)
+                                                score = distance_to_boundary + centroid_distance * 0.1
+                                                
+                                                if score < best_score:
+                                                    best_score = score
+                                                    best_distance = distance_to_boundary
+                                                    best_candidate = cad
+                                    except Exception:
+                                        continue
+                                
+                                if best_candidate is not None:
+                                    closest_cadastral = best_candidate
+                                    binding_method = f"boundary_distance_{best_distance:.2f}m_with_centroid_direction"
+                                    ccx, ccy = closest_cadastral.get('centroid', (None, None))
+                                    if ccx is not None and ccy is not None:
+                                        min_distance = math.hypot(v_centroid.x - ccx, v_centroid.y - ccy)
+                            
+                            # 4) Фолбэк: ближайший по расстоянию между центроидами (с ограничением порога)
+                            if closest_cadastral is None:
+                                v_cx, v_cy = v_centroid.coords[0]
+                                for cad in cadastral_objects:
+                                    try:
+                                        c_cx, c_cy = cad.get('centroid', (None, None))
+                                        if c_cx is None or c_cy is None:
+                                            continue
+                                        distance = math.hypot(v_cx - c_cx, v_cy - c_cy)
                                         if distance < min_distance:
                                             min_distance = distance
-                                            closest_cadastral = cadastral
+                                            closest_cadastral = cad
+                                            binding_method = f"nearest_centroid_{distance:.2f}m"
+                                    except Exception:
+                                        continue
+
+                                # если ближайший слишком далеко — считаем привязку недостоверной
+                                if min_distance > self.config['binding_max_nearest_distance_m']:
+                                    binding_method = f"nearest_too_far_{min_distance:.2f}m"
+                                    closest_cadastral = None
                             
+                            # Логирование качества привязки
+                            if closest_cadastral:
+                                print(f"[DEBUG] Нарушение площадью {sub_part.area:.2f}м² привязано к {closest_cadastral['cadastral_number']} методом: {binding_method}, расстояние: {min_distance:.2f}м")
+                            else:
+                                print(f"[WARN] Не удалось привязать нарушение площадью {sub_part.area:.2f}м² ни к одному участку")
+                                min_distance = float('inf')
+                         
                             # Создаем детальную информацию о нарушении
                             violation = {
                                 'geometry': sub_part,
@@ -840,6 +970,10 @@ class ComprehensiveAnalyzer:
                             violations.append(violation)
         
         print(f"Найдено {len(violations)} нарушений из {len(detected_objects)} инстансов")
+        
+        # Сортировка нарушений по кадастровому номеру для консистентной нумерации в документах
+        violations.sort(key=lambda v: (v.get('cadastral_number', 'zzz'), v.get('violation_area', 0)), reverse=True)
+        print(f"[INFO] Нарушения отсортированы по кадастровому номеру и площади")
         
         # Статистика
         if violations:
@@ -897,6 +1031,7 @@ class ComprehensiveAnalyzer:
         print("Создание пространственного индекса для кадастровых участков...")
         cadastral_geometries = [cadastral['geometry'] for cadastral in cadastral_objects]
         cadastral_tree = STRtree(cadastral_geometries)
+        geom_id_to_index = {id(g): i for i, g in enumerate(cadastral_geometries)}
         
         # Анализируем каждый обнаруженный объект
         for obj_idx, obj in enumerate(detected_objects):
@@ -907,7 +1042,22 @@ class ComprehensiveAnalyzer:
             remaining_poly = obj_poly  # Начинаем с полного объекта
             
             # Находим только те кадастровые участки, которые пересекаются с объектом
-            intersecting_cadastrals = cadastral_tree.query(obj_poly)
+            try:
+                q = cadastral_tree.query(obj_poly)
+            except Exception:
+                q = []
+            intersecting_cadastrals: List[int] = []
+            if q is not None:
+                try:
+                    if len(q) > 0:
+                        first = q[0]
+                        if isinstance(first, (int, np.integer)):
+                            intersecting_cadastrals = [int(i) for i in q]
+                        else:
+                            intersecting_cadastrals = [geom_id_to_index.get(id(g)) for g in q]
+                            intersecting_cadastrals = [i for i in intersecting_cadastrals if i is not None]
+                except TypeError:
+                    pass
             
             # Проверяем пересечения только с релевантными кадастровыми участками
             for cadastral_idx in intersecting_cadastrals:
@@ -915,15 +1065,12 @@ class ComprehensiveAnalyzer:
                 cadastral_poly = cadastral['geometry']
                 
                 if remaining_poly.intersects(cadastral_poly):
-                    # Вычитаем кадастровый участок из оставшейся части объекта
                     difference = remaining_poly.difference(cadastral_poly)
                     
                     if difference.is_empty:
-                        # Объект полностью покрыт кадастровым участком
                         remaining_poly = None
                         break
                     else:
-                        # Обновляем оставшуюся часть
                         remaining_poly = difference
             
             # Если осталась часть объекта после вычитания всех кадастровых участков
@@ -952,16 +1099,84 @@ class ComprehensiveAnalyzer:
                     
                     for sub_part in sub_parts:
                         if sub_part.area > self.config['min_violation_area']:
-                            # Находим ближайший кадастровый участок для определения номера
+                            # Улучшенная логика привязки (идентична основной функции)
+                            v_centroid = sub_part.centroid
                             closest_cadastral = None
                             min_distance = float('inf')
+                            binding_method = "unknown"
                             
-                            for cadastral in cadastral_objects:
-                                distance = sub_part.distance(cadastral['geometry'])
-                                if distance < min_distance:
-                                    min_distance = distance
-                                    closest_cadastral = cadastral
+                            # 1) Приоритет: центроид нарушения внутри участка
+                            for cad in cadastral_objects:
+                                try:
+                                    if cad['geometry'].contains(v_centroid):
+                                        closest_cadastral = cad
+                                        binding_method = "centroid_inside"
+                                        ccx, ccy = cad.get('centroid', (None, None))
+                                        if ccx is not None and ccy is not None:
+                                            min_distance = math.hypot(v_centroid.x - ccx, v_centroid.y - ccy)
+                                        break
+                                except Exception:
+                                    continue
                             
+                            # 2) Если не найдено - ищем максимальное пересечение
+                            if closest_cadastral is None:
+                                best_intersection_area = 0.0
+                                best_candidate = None
+                                for cad in cadastral_objects:
+                                    try:
+                                        if not sub_part.intersects(cad['geometry']):
+                                            continue
+                                        intersection = sub_part.intersection(cad['geometry'])
+                                        if intersection.is_empty:
+                                            continue
+                                        inter_area = intersection.area
+                                        inter_ratio = inter_area / max(sub_part.area, 1e-9)
+                                        if inter_ratio >= self.config['binding_min_intersection_ratio'] and inter_area > best_intersection_area:
+                                            best_intersection_area = inter_area
+                                            best_candidate = cad
+                                    except Exception:
+                                        continue
+
+                                if best_candidate is not None:
+                                    closest_cadastral = best_candidate
+                                    binding_method = f"max_intersection_ratio>={self.config['binding_min_intersection_ratio']}, {best_intersection_area:.2f}m2"
+                                    ccx, ccy = closest_cadastral.get('centroid', (None, None))
+                                    if ccx is not None and ccy is not None:
+                                        min_distance = math.hypot(v_centroid.x - ccx, v_centroid.y - ccy)
+
+                                if closest_cadastral is None and self.config['binding_boundary_buffer_m'] > 0:
+                                    boundary_buffer = sub_part.buffer(self.config['binding_boundary_buffer_m'])
+                                    for cad in cadastral_objects:
+                                        try:
+                                            if cad['geometry'].intersects(boundary_buffer):
+                                                closest_cadastral = cad
+                                                binding_method = f"boundary_buffer_{self.config['binding_boundary_buffer_m']}m"
+                                                ccx, ccy = cad.get('centroid', (None, None))
+                                                if ccx is not None and ccy is not None:
+                                                    min_distance = math.hypot(v_centroid.x - ccx, v_centroid.y - ccy)
+                                                break
+                                        except Exception:
+                                            continue
+                            
+                            # 3) Фолбэк: ближайший по расстоянию между центроидами (с ограничением порога)
+                            if closest_cadastral is None:
+                                v_cx, v_cy = v_centroid.coords[0]
+                                for cad in cadastral_objects:
+                                    try:
+                                        c_cx, c_cy = cad.get('centroid', (None, None))
+                                        if c_cx is None or c_cy is None:
+                                            continue
+                                        distance = math.hypot(v_cx - c_cx, v_cy - c_cy)
+                                        if distance < min_distance:
+                                            min_distance = distance
+                                            closest_cadastral = cad
+                                            binding_method = f"nearest_centroid_{distance:.2f}m"
+                                    except Exception:
+                                        continue
+                                if min_distance > self.config['binding_max_nearest_distance_m']:
+                                    binding_method = f"nearest_too_far_{min_distance:.2f}m"
+                                    closest_cadastral = None
+ 
                             # Создаем детальную информацию о нарушении
                             violation = {
                                 'geometry': sub_part,
@@ -1009,15 +1224,22 @@ class ComprehensiveAnalyzer:
             
             # Если объект полностью вне кадастровых участков
             if not has_intersection and obj_poly.area > self.config['min_violation_area']:
-                # Находим ближайший кадастровый участок
+                # Находим ближайший кадастровый участок по центроидам
                 closest_cadastral = None
                 min_distance = float('inf')
+                obj_centroid = obj_poly.centroid
                 
                 for cadastral in cadastral_objects:
-                    distance = obj_poly.distance(cadastral['geometry'])
-                    if distance < min_distance:
-                        min_distance = distance
-                        closest_cadastral = cadastral
+                    try:
+                        cad_centroid = cadastral.get('centroid', None)
+                        if cad_centroid is None:
+                            continue
+                        distance = math.hypot(obj_centroid.x - cad_centroid[0], obj_centroid.y - cad_centroid[1])
+                        if distance < min_distance:
+                            min_distance = distance
+                            closest_cadastral = cadastral
+                    except Exception:
+                        continue
                 
                 # Создаем детальную информацию о нарушении
                 violation = {
@@ -1092,6 +1314,10 @@ class ComprehensiveAnalyzer:
         print(f"Объекты полностью вне кадастра: {objects_outside_cadastre}")
         print(f"===================================\n")
         
+        # Сортировка нарушений по кадастровому номеру для консистентной нумерации
+        violations.sort(key=lambda v: (v.get('cadastral_number', 'zzz'), v.get('violation_area', 0)), reverse=True)
+        print(f"[INFO] Нарушения отсортированы по кадастровому номеру и площади (старый алгоритм)")
+        
         return violations
     
     def save_to_shapefile(self, objects: List[Dict], filename: str, crs):
@@ -1104,14 +1330,17 @@ class ComprehensiveAnalyzer:
         gdf = gpd.GeoDataFrame(geometry=geometries, crs=crs)
         
         # Добавление атрибутов с короткими именами (ограничение Shapefile - 10 символов)
-        if 'cadastral_number' in objects[0]:
-            gdf['cad_num'] = [obj.get('cadastral_number', '') for obj in objects]
-            gdf['area_m2'] = [obj.get('area_sqm', 0) for obj in objects]
-        elif 'violation_area' in objects[0]:
+        # ВАЖНО: Сначала проверяем на нарушения, т.к. у них тоже есть 'cadastral_number'
+        first_obj = objects[0]
+        if 'violation_area' in first_obj:
             # Для нарушений
             gdf['cad_num'] = [obj.get('cadastral_number', '') for obj in objects]
             gdf['viol_area'] = [obj.get('violation_area', 0) for obj in objects]
             gdf['orig_area'] = [obj.get('original_object_area', 0) for obj in objects]
+        elif 'cadastral_number' in first_obj and 'area_sqm' in first_obj:
+            # Для кадастровых участков
+            gdf['cad_num'] = [obj.get('cadastral_number', '') for obj in objects]
+            gdf['area_m2'] = [obj.get('area_sqm', 0) for obj in objects]
         else:
             # Для обнаруженных объектов
             gdf['area_m2'] = [obj.get('area_sqm', 0) for obj in objects]
@@ -1119,7 +1348,11 @@ class ComprehensiveAnalyzer:
             gdf['centroid_y'] = [obj.get('centroid', (0, 0))[1] for obj in objects]
         
         output_path = os.path.join(self.config['output_dir'], filename)
-        gdf.to_file(output_path)
+        # Пытаемся явно указать кодировку для корректной записи .cpg
+        try:
+            gdf.to_file(output_path, encoding='utf-8')
+        except Exception:
+            gdf.to_file(output_path)
         print(f"Сохранено в {output_path}")
     
     def create_visualization(self, geotiff_data: Dict, detected_objects: List[Dict], 
@@ -1130,7 +1363,15 @@ class ComprehensiveAnalyzer:
         fig, ax = plt.subplots(1, 1, figsize=(15, 15))
         if geotiff_data['data'].shape[0] >= 3:
             rgb_data = np.transpose(geotiff_data['data'][:3], (1, 2, 0))
-            rgb_data = (rgb_data - rgb_data.min()) / (rgb_data.max() - rgb_data.min())
+            # Нормализация по каналам с защитой от деления на ноль
+            for i in range(3):
+                ch = rgb_data[:, :, i]
+                ch_min = float(np.nanmin(ch))
+                ch_max = float(np.nanmax(ch))
+                if ch_max > ch_min:
+                    rgb_data[:, :, i] = (ch - ch_min) / (ch_max - ch_min)
+                else:
+                    rgb_data[:, :, i] = 0
             bounds = geotiff_data['bounds']
             ax.imshow(rgb_data, extent=[bounds[0], bounds[2], bounds[1], bounds[3]])
         # Кадастровые границы (синие, очень тонкие)
@@ -1141,12 +1382,12 @@ class ComprehensiveAnalyzer:
         # Обнаруженные объекты (светло-желтый, очень тонкая оранжевая граница)
         for obj in detected_objects:
             coords = list(obj['geometry'].exterior.coords)
-            poly = MplPolygon(coords, facecolor='#fff700', alpha=0.25, edgecolor='#ffb300', linewidth=0.5)
+            poly = MplPolygon(coords, facecolor='#fff700', alpha=0.25, edgecolor='#ffb300', linewidth=0.4)
             ax.add_patch(poly)
         # Нарушения (ярко-красный, тонкая граница)
         for violation in violations:
             coords = list(violation['geometry'].exterior.coords)
-            poly = MplPolygon(coords, facecolor='#ff0000', alpha=0.8, edgecolor='#800000', linewidth=0.7)
+            poly = MplPolygon(coords, facecolor='#ff0000', alpha=0.75, edgecolor='#800000', linewidth=0.6)
             ax.add_patch(poly)
             centroid = violation['centroid']
             ax.text(centroid[0], centroid[1], f"{violation['violation_area']:.1f} м²", fontsize=8, ha='center', va='center', color='white', weight='bold', bbox=dict(boxstyle="round,pad=0.3", facecolor='red', alpha=0.8))
@@ -1328,6 +1569,16 @@ class ComprehensiveAnalyzer:
     def export_to_excel(self, cadastral_objects: List[Dict], violations: List[Dict]):
         """Экспорт результатов в Excel (XLSX) с детальной информацией о координатах"""
         output_path = os.path.join(self.config['output_dir'], 'report.xlsx')
+        def _present_xy(x, y):
+            try:
+                xf = float(x)
+                yf = float(y)
+            except Exception:
+                return x, y
+            new_x = yf
+            sign = -1.0 if xf < 0 else 1.0
+            new_y = sign * (4000000.0 + abs(xf))
+            return new_x, new_y
         
         # Лист 1: Сводная информация
         summary_data = []
@@ -1357,8 +1608,8 @@ class ComprehensiveAnalyzer:
                 'Идентификатор объекта': obj.get('object_id', ''),
                 'Площадь, м²': round(obj.get('area_sqm', 0), 2),
                 'Площадь, га': round(obj.get('area_sqm', 0) / 10000, 6),
-                'Центроид X': round(obj.get('centroid', (0, 0))[0], 6),
-                'Центроид Y': round(obj.get('centroid', (0, 0))[1], 6),
+                'Центроид X': round(_present_xy(obj.get('centroid', (0, 0))[0], obj.get('centroid', (0, 0))[1])[0], 6),
+                'Центроид Y': round(_present_xy(obj.get('centroid', (0, 0))[0], obj.get('centroid', (0, 0))[1])[1], 6),
                 'Периметр, м': round(obj['geometry'].length, 2) if obj.get('geometry') else 0
             }
             
@@ -1374,10 +1625,11 @@ class ComprehensiveAnalyzer:
             
             # Координаты первых 10 точек контура
             if obj.get('exterior_coords'):
-                coords = obj['exterior_coords'][:10]  # Берем первые 10 точек
+                coords = obj['exterior_coords'][:10]
                 for j, (x, y) in enumerate(coords, 1):
-                    row[f'Точка {j} X'] = round(x, 6)
-                    row[f'Точка {j} Y'] = round(y, 6)
+                    px, py = _present_xy(x, y)
+                    row[f'Точка {j} X'] = round(px, 6)
+                    row[f'Точка {j} Y'] = round(py, 6)
             
             # Дополнительные атрибуты из MID/MIF
             if obj.get('attributes'):
@@ -1400,8 +1652,8 @@ class ComprehensiveAnalyzer:
                 'Площадь нарушения, м²': round(v.get('violation_area', 0), 2),
                 'Площадь нарушения, га': round(v.get('violation_area', 0) / 10000, 6),
                 'Площадь исходного объекта, м²': round(v.get('original_object_area', 0), 2),
-                'Центроид X': round(v.get('centroid', (0, 0))[0], 6),
-                'Центроид Y': round(v.get('centroid', (0, 0))[1], 6),
+                'Центроид X': round(_present_xy(v.get('centroid', (0, 0))[0], v.get('centroid', (0, 0))[1])[0], 6),
+                'Центроид Y': round(_present_xy(v.get('centroid', (0, 0))[0], v.get('centroid', (0, 0))[1])[1], 6),
                 'Ближайший кадастровый номер': v.get('cadastral_number', ''),
                 'Периметр нарушения, м': round(v['geometry'].length, 2) if v.get('geometry') else 0
             }
@@ -1410,18 +1662,19 @@ class ComprehensiveAnalyzer:
             if v.get('geometry'):
                 bounds = v['geometry'].bounds
                 row.update({
-                    'Мин X': round(bounds[0], 6),
-                    'Мин Y': round(bounds[1], 6),
-                    'Макс X': round(bounds[2], 6),
-                    'Макс Y': round(bounds[3], 6)
+                    'Мин X': round(_present_xy(bounds[0], bounds[1])[0], 6),
+                    'Мин Y': round(_present_xy(bounds[0], bounds[1])[1], 6),
+                    'Макс X': round(_present_xy(bounds[2], bounds[3])[0], 6),
+                    'Макс Y': round(_present_xy(bounds[2], bounds[3])[1], 6)
                 })
                 
                 # Координаты контура нарушения (первые 10 точек)
                 try:
                     coords = list(v['geometry'].exterior.coords)[:10]
                     for j, (x, y) in enumerate(coords, 1):
-                        row[f'Точка {j} X'] = round(x, 6)
-                        row[f'Точка {j} Y'] = round(y, 6)
+                        px, py = _present_xy(x, y)
+                        row[f'Точка {j} X'] = round(px, 6)
+                        row[f'Точка {j} Y'] = round(py, 6)
                 except:
                     pass
             
@@ -1437,11 +1690,12 @@ class ComprehensiveAnalyzer:
         for i, obj in enumerate(cadastral_objects, 1):
             if obj.get('exterior_coords'):
                 for j, (x, y) in enumerate(obj['exterior_coords'], 1):
+                    px, py = _present_xy(x, y)
                     all_coords_data.append({
                         'Кадастровый номер': obj.get('cadastral_number', ''),
                         'Номер точки': j,
-                        'X': round(x, 6),
-                        'Y': round(y, 6)
+                        'X': round(px, 6),
+                        'Y': round(py, 6)
                     })
         
         all_coords_df = pd.DataFrame(all_coords_data)
@@ -1453,11 +1707,12 @@ class ComprehensiveAnalyzer:
                 try:
                     coords = list(v['geometry'].exterior.coords)
                     for j, (x, y) in enumerate(coords, 1):
+                        px, py = _present_xy(x, y)
                         violation_coords_data.append({
                             '№ нарушения': i,
                             'Номер точки': j,
-                            'X': round(x, 6),
-                            'Y': round(y, 6)
+                            'X': round(px, 6),
+                            'Y': round(py, 6)
                         })
                 except:
                     pass
@@ -1524,6 +1779,8 @@ class ComprehensiveAnalyzer:
         # Создаем пространственный индекс
         geometries = [inst['geometry'] for inst in instances]
         tree = STRtree(geometries)
+        # Для совместимости с Shapely 1.8/2.0: сопоставление id(geom) -> индекс
+        geom_id_to_index = {id(g): i for i, g in enumerate(geometries)}
         
         duplicates = set()
         
@@ -1533,12 +1790,25 @@ class ComprehensiveAnalyzer:
                 
             geom = instance['geometry']
             # Находим потенциальные дубли (пересекающиеся объекты)
-            intersecting_indices = tree.query(geom)
-            
-            for j in intersecting_indices:
+            q = tree.query(geom)
+            # Приводим результаты к списку индексов
+            candidate_indices: List[int] = []
+            try:
+                if len(q) > 0:
+                    first = q[0]
+                    # Shapely 1.8: возвращаются индексы
+                    if isinstance(first, (int, np.integer)):
+                        candidate_indices = [int(k) for k in q]
+                    else:
+                        # Shapely 2.0: возвращаются геометрии
+                        candidate_indices = [geom_id_to_index.get(id(g)) for g in q]
+                        candidate_indices = [k for k in candidate_indices if k is not None]
+            except TypeError:
+                candidate_indices = []
+
+            for j in candidate_indices:
                 if j <= i or j in duplicates:  # Пропускаем уже проверенные и самого себя
                     continue
-                    
                 other_geom = instances[j]['geometry']
                 
                 # Вычисляем площадь пересечения
