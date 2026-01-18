@@ -38,8 +38,3 @@ dependencies:
 
   # Detectron2 (conda build)
   - detectron2
-
-  # pip — оставляем только если реально нужен
-  - pip
-  - pip:
-      - pycocotools
