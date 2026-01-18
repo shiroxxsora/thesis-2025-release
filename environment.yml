@@ -3,28 +3,43 @@ channels:
   - pytorch
   - nvidia
   - conda-forge
+
 dependencies:
   - python=3.10
+
+  # Core scientific stack
   - numpy
   - scipy
+  - pandas
+  - cython
+  - tqdm
+  - pyyaml
+
+  # Computer vision / imaging
   - opencv
+  - pillow
+  - matplotlib
+
+  # Geo stack
   - gdal
   - rasterio
   - shapely
-  - matplotlib
-  - pillow
-  - pyyaml
-  - tqdm
   - geopandas
-  - cython
-  - pandas
+
+  # Reports / exports
   - reportlab
   - openpyxl
+
+  # PyTorch + CUDA (conda-variant)
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1
+
+  # Detectron2 (conda build)
+  - detectron2
+
+  # pip — оставляем только если реально нужен
   - pip
   - pip:
-      - ninja
       - pycocotools
-      - torch==2.7.1 --index-url https://download.pytorch.org/whl/cu118
-      - torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu118
-      - torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu118
-      - git+https://github.com/facebookresearch/detectron2.git
