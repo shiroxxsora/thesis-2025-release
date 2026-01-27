@@ -2,6 +2,7 @@ import os
 import sys
 import math
 import argparse
+import warnings
 from typing import List, Tuple, Optional, Dict, Any
 
 import pandas as pd
@@ -15,6 +16,14 @@ from matplotlib.path import Path as MplPath
 from matplotlib.patches import PathPatch
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from io import BytesIO
+
+# Pillow для контроля размера изображений
+try:
+    from PIL import Image as PILImage
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -677,9 +686,143 @@ def _make_zoom_image_for_parcel(cadastral_number: str,
 
     ax.set_aspect('equal', adjustable='box')
     ax.axis('off')
-    plt.tight_layout()
-    fig.savefig(save_path, bbox_inches='tight')
-    plt.close(fig)
+    
+    # Проверяем размер изображения ДО tight_layout
+    # Максимальный размер: 2^16 = 65536 пикселей
+    max_pixels = 65536
+    max_figsize = 10.0  # максимальный размер фигуры в дюймах
+    current_dpi = 130
+    
+    # Получаем текущие границы осей для оценки размера
+    xlim = ax.get_xlim()
+    ylim = ax.get_ylim()
+    coord_width = abs(xlim[1] - xlim[0])
+    coord_height = abs(ylim[1] - ylim[0])
+    
+    # Если координаты очень большие, это может привести к огромным изображениям
+    # Ограничиваем размер фигуры заранее
+    fig_width_inches, fig_height_inches = fig.get_size_inches()
+    
+    # Если координаты слишком большие, уменьшаем размер фигуры
+    if coord_width > 0 and coord_height > 0:
+        # Оцениваем необходимый размер фигуры на основе координат
+        # Предполагаем, что 1 дюйм = примерно 1000 единиц координат (эмпирически)
+        estimated_fig_width = min(max_figsize, coord_width / 1000.0)
+        estimated_fig_height = min(max_figsize, coord_height / 1000.0)
+        
+        if estimated_fig_width < fig_width_inches or estimated_fig_height < fig_height_inches:
+            fig.set_size_inches(min(estimated_fig_width, max_figsize), min(estimated_fig_height, max_figsize))
+            print(f"[DEBUG] Уменьшаю размер фигуры до {fig.get_size_inches()} (координаты: {coord_width:.1f}x{coord_height:.1f})", flush=True)
+    
+    # Проверяем размер изображения после ограничения фигуры
+    fig_width_inches, fig_height_inches = fig.get_size_inches()
+    estimated_width = int(fig_width_inches * current_dpi)
+    estimated_height = int(fig_height_inches * current_dpi)
+    
+    # Если изображение слишком большое, уменьшаем DPI
+    if estimated_width > max_pixels or estimated_height > max_pixels:
+        scale_factor = min(max_pixels / estimated_width, max_pixels / estimated_height)
+        current_dpi = max(72, int(current_dpi * scale_factor))
+        print(f"[DEBUG] Уменьшаю DPI до {current_dpi} для предотвращения слишком большого изображения", flush=True)
+    
+    # Дополнительная проверка: ограничиваем размер фигуры
+    if fig_width_inches > max_figsize or fig_height_inches > max_figsize:
+        scale = min(max_figsize / fig_width_inches, max_figsize / fig_height_inches)
+        fig.set_size_inches(fig_width_inches * scale, fig_height_inches * scale)
+        print(f"[DEBUG] Уменьшаю размер фигуры до {fig.get_size_inches()}", flush=True)
+    
+    # Подавление предупреждений tight_layout
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        try:
+            plt.tight_layout(pad=1.0)
+        except Exception:
+            pass
+    
+    # Финальная проверка размера после tight_layout
+    fig_width_inches, fig_height_inches = fig.get_size_inches()
+    estimated_width = int(fig_width_inches * current_dpi)
+    estimated_height = int(fig_height_inches * current_dpi)
+    
+    if estimated_width > max_pixels or estimated_height > max_pixels:
+        # Если tight_layout увеличил размер, уменьшаем DPI ещё больше
+        scale_factor = min(max_pixels / estimated_width, max_pixels / estimated_height)
+        current_dpi = max(72, int(current_dpi * scale_factor))
+        print(f"[DEBUG] После tight_layout: уменьшаю DPI до {current_dpi}", flush=True)
+    
+    # Финальная проверка: если размер всё равно слишком большой, используем фиксированный размер
+    fig_width_inches, fig_height_inches = fig.get_size_inches()
+    estimated_width = int(fig_width_inches * current_dpi)
+    estimated_height = int(fig_height_inches * current_dpi)
+    
+    if estimated_width > max_pixels or estimated_height > max_pixels:
+        # Принудительно ограничиваем размер фигуры
+        max_size_inches = max_pixels / current_dpi
+        if fig_width_inches > max_size_inches:
+            fig.set_size_inches(max_size_inches, fig_height_inches * (max_size_inches / fig_width_inches))
+        if fig_height_inches > max_size_inches:
+            fig.set_size_inches(fig_width_inches * (max_size_inches / fig_height_inches), max_size_inches)
+        print(f"[DEBUG] Принудительно ограничиваю размер фигуры до {fig.get_size_inches()}", flush=True)
+    
+    # Сохраняем через Pillow для гарантированного контроля размера
+    try:
+        if PIL_AVAILABLE:
+            # Сохраняем в буфер
+            buf = BytesIO()
+            fig.savefig(buf, format='png', bbox_inches='tight', dpi=current_dpi)
+            buf.seek(0)
+            
+            # Загружаем в Pillow
+            img = PILImage.open(buf)
+            width, height = img.size
+            
+            # Проверяем размер и изменяем, если нужно
+            if width > max_pixels or height > max_pixels:
+                scale = min(max_pixels / width, max_pixels / height)
+                new_width = int(width * scale)
+                new_height = int(height * scale)
+                print(f"[DEBUG] Pillow: изменяю размер изображения с {width}x{height} до {new_width}x{new_height}", flush=True)
+                # Используем LANCZOS для лучшего качества, с fallback на старые версии Pillow
+                try:
+                    img = img.resize((new_width, new_height), PILImage.Resampling.LANCZOS)
+                except AttributeError:
+                    # Для старых версий Pillow (< 10.0)
+                    img = img.resize((new_width, new_height), PILImage.LANCZOS)
+            
+            # Сохраняем финальное изображение
+            img.save(save_path, 'PNG', optimize=True)
+            buf.close()
+        else:
+            # Fallback на обычное сохранение, если Pillow недоступен
+            fig.savefig(save_path, bbox_inches='tight', dpi=current_dpi)
+    except Exception as e:
+        # Если всё равно не удалось сохранить из-за размера, пробуем с минимальным DPI
+        error_msg = str(e).lower()
+        if "too large" in error_msg or "2^16" in error_msg or "65536" in error_msg:
+            print(f"[WARN] Изображение слишком большое даже после ограничений. Пробую минимальный DPI...", flush=True)
+            fig.set_size_inches(max_figsize, max_figsize)
+            if PIL_AVAILABLE:
+                buf = BytesIO()
+                fig.savefig(buf, format='png', bbox_inches='tight', dpi=72)
+                buf.seek(0)
+                img = PILImage.open(buf)
+                width, height = img.size
+                if width > max_pixels or height > max_pixels:
+                    scale = min(max_pixels / width, max_pixels / height)
+                    # Используем LANCZOS для лучшего качества, с fallback на старые версии Pillow
+                    try:
+                        img = img.resize((int(width * scale), int(height * scale)), PILImage.Resampling.LANCZOS)
+                    except AttributeError:
+                        # Для старых версий Pillow (< 10.0)
+                        img = img.resize((int(width * scale), int(height * scale)), PILImage.LANCZOS)
+                img.save(save_path, 'PNG', optimize=True)
+                buf.close()
+            else:
+                fig.savefig(save_path, bbox_inches='tight', dpi=72)
+        else:
+            raise
+    finally:
+        plt.close(fig)
 
 
 def _plot_shapely(ax, geom, facecolor='none', edgecolor='black', linewidth=1.0, alpha=1.0):
@@ -906,9 +1049,143 @@ def _make_overview_map(cadastral_number: str,
     ax.set_aspect('equal', adjustable='box')
     ax.set_title(f'Обзорная карта участка {cadastral_number}', fontsize=10, weight='bold')
     ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
-    plt.tight_layout()
-    fig.savefig(save_path, bbox_inches='tight', dpi=150)
-    plt.close(fig)
+    
+    # Проверяем размер изображения ДО tight_layout
+    # Максимальный размер: 2^16 = 65536 пикселей
+    max_pixels = 65536
+    max_figsize = 10.0  # максимальный размер фигуры в дюймах
+    current_dpi = 150
+    
+    # Получаем текущие границы осей для оценки размера
+    xlim = ax.get_xlim()
+    ylim = ax.get_ylim()
+    coord_width = abs(xlim[1] - xlim[0])
+    coord_height = abs(ylim[1] - ylim[0])
+    
+    # Если координаты очень большие, это может привести к огромным изображениям
+    # Ограничиваем размер фигуры заранее
+    fig_width_inches, fig_height_inches = fig.get_size_inches()
+    
+    # Если координаты слишком большие, уменьшаем размер фигуры
+    if coord_width > 0 and coord_height > 0:
+        # Оцениваем необходимый размер фигуры на основе координат
+        # Предполагаем, что 1 дюйм = примерно 1000 единиц координат (эмпирически)
+        estimated_fig_width = min(max_figsize, coord_width / 1000.0)
+        estimated_fig_height = min(max_figsize, coord_height / 1000.0)
+        
+        if estimated_fig_width < fig_width_inches or estimated_fig_height < fig_height_inches:
+            fig.set_size_inches(min(estimated_fig_width, max_figsize), min(estimated_fig_height, max_figsize))
+            print(f"[DEBUG] Уменьшаю размер фигуры до {fig.get_size_inches()} (координаты: {coord_width:.1f}x{coord_height:.1f})", flush=True)
+    
+    # Проверяем размер изображения после ограничения фигуры
+    fig_width_inches, fig_height_inches = fig.get_size_inches()
+    estimated_width = int(fig_width_inches * current_dpi)
+    estimated_height = int(fig_height_inches * current_dpi)
+    
+    # Если изображение слишком большое, уменьшаем DPI
+    if estimated_width > max_pixels or estimated_height > max_pixels:
+        scale_factor = min(max_pixels / estimated_width, max_pixels / estimated_height)
+        current_dpi = max(72, int(current_dpi * scale_factor))
+        print(f"[DEBUG] Уменьшаю DPI до {current_dpi} для предотвращения слишком большого изображения", flush=True)
+    
+    # Дополнительная проверка: ограничиваем размер фигуры
+    if fig_width_inches > max_figsize or fig_height_inches > max_figsize:
+        scale = min(max_figsize / fig_width_inches, max_figsize / fig_height_inches)
+        fig.set_size_inches(fig_width_inches * scale, fig_height_inches * scale)
+        print(f"[DEBUG] Уменьшаю размер фигуры до {fig.get_size_inches()}", flush=True)
+    
+    # Подавление предупреждений tight_layout
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        try:
+            plt.tight_layout(pad=1.0)
+        except Exception:
+            pass
+    
+    # Финальная проверка размера после tight_layout
+    fig_width_inches, fig_height_inches = fig.get_size_inches()
+    estimated_width = int(fig_width_inches * current_dpi)
+    estimated_height = int(fig_height_inches * current_dpi)
+    
+    if estimated_width > max_pixels or estimated_height > max_pixels:
+        # Если tight_layout увеличил размер, уменьшаем DPI ещё больше
+        scale_factor = min(max_pixels / estimated_width, max_pixels / estimated_height)
+        current_dpi = max(72, int(current_dpi * scale_factor))
+        print(f"[DEBUG] После tight_layout: уменьшаю DPI до {current_dpi}", flush=True)
+    
+    # Финальная проверка: если размер всё равно слишком большой, используем фиксированный размер
+    fig_width_inches, fig_height_inches = fig.get_size_inches()
+    estimated_width = int(fig_width_inches * current_dpi)
+    estimated_height = int(fig_height_inches * current_dpi)
+    
+    if estimated_width > max_pixels or estimated_height > max_pixels:
+        # Принудительно ограничиваем размер фигуры
+        max_size_inches = max_pixels / current_dpi
+        if fig_width_inches > max_size_inches:
+            fig.set_size_inches(max_size_inches, fig_height_inches * (max_size_inches / fig_width_inches))
+        if fig_height_inches > max_size_inches:
+            fig.set_size_inches(fig_width_inches * (max_size_inches / fig_height_inches), max_size_inches)
+        print(f"[DEBUG] Принудительно ограничиваю размер фигуры до {fig.get_size_inches()}", flush=True)
+    
+    # Сохраняем через Pillow для гарантированного контроля размера
+    try:
+        if PIL_AVAILABLE:
+            # Сохраняем в буфер
+            buf = BytesIO()
+            fig.savefig(buf, format='png', bbox_inches='tight', dpi=current_dpi)
+            buf.seek(0)
+            
+            # Загружаем в Pillow
+            img = PILImage.open(buf)
+            width, height = img.size
+            
+            # Проверяем размер и изменяем, если нужно
+            if width > max_pixels or height > max_pixels:
+                scale = min(max_pixels / width, max_pixels / height)
+                new_width = int(width * scale)
+                new_height = int(height * scale)
+                print(f"[DEBUG] Pillow: изменяю размер изображения с {width}x{height} до {new_width}x{new_height}", flush=True)
+                # Используем LANCZOS для лучшего качества, с fallback на старые версии Pillow
+                try:
+                    img = img.resize((new_width, new_height), PILImage.Resampling.LANCZOS)
+                except AttributeError:
+                    # Для старых версий Pillow (< 10.0)
+                    img = img.resize((new_width, new_height), PILImage.LANCZOS)
+            
+            # Сохраняем финальное изображение
+            img.save(save_path, 'PNG', optimize=True)
+            buf.close()
+        else:
+            # Fallback на обычное сохранение, если Pillow недоступен
+            fig.savefig(save_path, bbox_inches='tight', dpi=current_dpi)
+    except Exception as e:
+        # Если всё равно не удалось сохранить из-за размера, пробуем с минимальным DPI
+        error_msg = str(e).lower()
+        if "too large" in error_msg or "2^16" in error_msg or "65536" in error_msg:
+            print(f"[WARN] Изображение слишком большое даже после ограничений. Пробую минимальный DPI...", flush=True)
+            fig.set_size_inches(max_figsize, max_figsize)
+            if PIL_AVAILABLE:
+                buf = BytesIO()
+                fig.savefig(buf, format='png', bbox_inches='tight', dpi=72)
+                buf.seek(0)
+                img = PILImage.open(buf)
+                width, height = img.size
+                if width > max_pixels or height > max_pixels:
+                    scale = min(max_pixels / width, max_pixels / height)
+                    # Используем LANCZOS для лучшего качества, с fallback на старые версии Pillow
+                    try:
+                        img = img.resize((int(width * scale), int(height * scale)), PILImage.Resampling.LANCZOS)
+                    except AttributeError:
+                        # Для старых версий Pillow (< 10.0)
+                        img = img.resize((int(width * scale), int(height * scale)), PILImage.LANCZOS)
+                img.save(save_path, 'PNG', optimize=True)
+                buf.close()
+            else:
+                fig.savefig(save_path, bbox_inches='tight', dpi=72)
+        else:
+            raise
+    finally:
+        plt.close(fig)
 
 
 def _build_docx(docx_path: str,

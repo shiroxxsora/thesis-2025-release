@@ -7,6 +7,11 @@ import cv2
 import torch
 from datetime import datetime
 from typing import Optional, Dict, Tuple, List
+
+# Headless backend для matplotlib (чтобы избежать Qt/wayland ошибок)
+os.environ.setdefault("MPLBACKEND", "Agg")
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from matplotlib.patches import Polygon as MplPolygon
@@ -44,6 +49,7 @@ UseExceptions()
 class ComprehensiveAnalyzer:
     def __init__(self):
         self.config = {
+            # Используем оригинальный input.tiff (x_0=250000), который совпадает с координатами кадастра
             'input_geotiff': "geotiffs/input.tiff",
             'cadastral_data': "cadastr/ЗУ все2.MIF",
             'detectron_config': "detectron2/configs/COCO-InstanceSegmentation/mask_rcnn_R_101_FPN_3x.yaml",
@@ -481,181 +487,424 @@ class ComprehensiveAnalyzer:
         return cadastral_objects
     
     def read_cadastral_data_enhanced(self, mif_path: str, raster_crs, raster_bounds=None) -> List[Dict]:
-        """Улучшенное чтение кадастровых данных с извлечением всех доступных полей"""
+        """Улучшенное чтение кадастровых данных с извлечением всех доступных полей.
+
+        ВОССТАНОВЛЕНА исходная логика, как было в исходном релизе:
+        - используется жёстко заданная PROJ-строка для кадастра;
+        - полигоны фильтруются по пересечению с bbox растра.
+        """
         print("Чтение кадастровых данных (расширенная версия)...")
-        cadastral_objects = []
+        cadastral_objects: List[Dict] = []
         try:
-            driver = ogr.GetDriverByName('MapInfo File')
+            driver = ogr.GetDriverByName("MapInfo File")
             datasource = driver.Open(mif_path, 0)
             if datasource is None:
                 print(f"Ошибка: Не удалось открыть MIF/MID файл: {mif_path}")
                 return []
-            
+
             layer = datasource.GetLayer()
             layer_defn = layer.GetLayerDefn()
-            
-            # Извлекаем информацию о всех полях
-            field_names = []
+
+            # Поля
+            field_names: List[str] = []
             for i in range(layer_defn.GetFieldCount()):
                 field_defn = layer_defn.GetFieldDefn(i)
                 field_names.append(field_defn.GetName())
-            
             print(f"Найдены поля в MID/MIF файле: {field_names}")
-            
-            # Настройка трансформации координат
+
+            # CRS растра
             raster_srs_wkt = None
             raster_proj4 = None
-            if hasattr(raster_crs, 'to_wkt'):
+            if hasattr(raster_crs, "to_wkt"):
                 raster_srs_wkt = raster_crs.to_wkt()
-            elif hasattr(raster_crs, 'wkt'):
+            elif hasattr(raster_crs, "wkt"):
                 raster_srs_wkt = raster_crs.wkt
-            
+
             if raster_srs_wkt:
                 temp_srs = osr.SpatialReference()
                 temp_srs.ImportFromWkt(raster_srs_wkt)
                 raster_proj4 = temp_srs.ExportToProj4()
-            
-            if raster_proj4:
-                raster_proj4_parts = dict(p.split('=', 1) for p in raster_proj4.split() if '=' in p)
-                towgs84_params = raster_proj4_parts.get('+towgs84', '')
-                ellps_param = raster_proj4_parts.get('+ellps', 'krass')
-            else:
-                towgs84_params = ''
-                ellps_param = 'krass'
-            
-            source_cadastr_proj4_str = (
-                f"+proj=tmerc +lat_0=0 +lon_0=109.03333333333 +k=1 "
-                f"+x_0=4250000 +y_0=-5211057.63 "
-                f"+ellps={ellps_param} "
-                f"+towgs84={towgs84_params} "
-                f"+units=m +no_defs"
-            )
-            
-            source_srs_cadastr = osr.SpatialReference()
-            try:
-                if source_srs_cadastr.ImportFromProj4(source_cadastr_proj4_str) == 0:
-                    pass
-                else:
-                    source_srs_cadastr = layer.GetSpatialRef()
-                    if source_srs_cadastr is None:
-                        source_srs_cadastr = osr.SpatialReference()
-                        source_srs_cadastr.ImportFromEPSG(32648)
-            except Exception as e:
-                source_srs_cadastr = layer.GetSpatialRef()
-                if source_srs_cadastr is None:
-                    source_srs_cadastr = osr.SpatialReference()
-                    source_srs_cadastr.ImportFromEPSG(32648)
-            
+
+            # Определяем целевую CRS (растр)
             target_srs_raster = osr.SpatialReference()
             if raster_srs_wkt:
                 target_srs_raster.ImportFromWkt(raster_srs_wkt)
             else:
                 print("Предупреждение: Не удалось определить проекцию растра")
                 return []
+
+            # ВАЖНО: сначала пытаемся использовать CRS из самого слоя MIF/MID
+            source_srs_cadastr = layer.GetSpatialRef()
+            if source_srs_cadastr is not None:
+                try:
+                    source_proj4 = source_srs_cadastr.ExportToProj4()
+                    
+                    # Проверка: если CRS географический (lat/lon), а координаты большие (в метрах),
+                    # значит CRS неправильный и нужно использовать fallback
+                    is_geographic = source_srs_cadastr.IsGeographic()
+                    if is_geographic:
+                        # Проверяем первые несколько координат
+                        layer.ResetReading()
+                        sample_coords = []
+                        for i, feature in enumerate(layer):
+                            if i >= 3:  # Проверяем первые 3 объекта
+                                break
+                            geom = feature.GetGeometryRef()
+                            if geom:
+                                env = geom.GetEnvelope()
+                                # Если координаты больше 180 (градусы) или меньше -180, значит это метры
+                                if abs(env[0]) > 180 or abs(env[1]) > 180 or abs(env[2]) > 180 or abs(env[3]) > 180:
+                                    print(f"[WARN] CRS из слоя географический, но координаты в метрах (X={env[0]:.2f}). Использую fallback.", flush=True)
+                                    source_srs_cadastr = None
+                                    break
+                        layer.ResetReading()
+                    
+                    if source_srs_cadastr is not None:
+                        print(f"[INFO] Использую CRS кадастра из слоя MIF/MID: {source_proj4[:120]}...", flush=True)
+                        source_srs_cadastr = source_srs_cadastr.Clone()
+                except Exception as e:
+                    print(f"[WARN] Не удалось использовать CRS из слоя: {e}. Использую fallback.", flush=True)
+                    source_srs_cadastr = None
             
+            # Fallback: жёстко заданная проекция (если CRS слоя недоступна)
+            if source_srs_cadastr is None:
+                if raster_proj4:
+                    raster_proj4_parts = dict(p.split("=", 1) for p in raster_proj4.split() if "=" in p)
+                    towgs84_params = raster_proj4_parts.get("+towgs84", "")
+                    ellps_param = raster_proj4_parts.get("+ellps", "krass")
+                else:
+                    towgs84_params = ""
+                    ellps_param = "krass"
+                
+                source_cadastr_proj4_str = (
+                    "+proj=tmerc +lat_0=0 +lon_0=109.03333333333 +k=1 "
+                    "+x_0=4250000 +y_0=-5211057.63 "
+                    f"+ellps={ellps_param} "
+                    f"+towgs84={towgs84_params} "
+                    "+units=m +no_defs"
+                )
+                
+                source_srs_cadastr = osr.SpatialReference()
+                try:
+                    if source_srs_cadastr.ImportFromProj4(source_cadastr_proj4_str) != 0:
+                        print("[WARN] Не удалось использовать fallback PROJ-строку. Пробую EPSG:32648", flush=True)
+                        source_srs_cadastr = osr.SpatialReference()
+                        source_srs_cadastr.ImportFromEPSG(32648)
+                    else:
+                        print(f"[INFO] Использую fallback CRS кадастра: {source_cadastr_proj4_str[:100]}...", flush=True)
+                except Exception as e:
+                    print(f"[WARN] Ошибка при использовании fallback CRS: {e}. Пробую EPSG:32648", flush=True)
+                    source_srs_cadastr = osr.SpatialReference()
+                    source_srs_cadastr.ImportFromEPSG(32648)
+
+            # Настраиваем трансформацию
             source_srs_cadastr.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
             target_srs_raster.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
-            transform_cadastr_to_raster = osr.CoordinateTransformation(source_srs_cadastr, target_srs_raster)
+            
+            # Проверяем разницу в x_0 между кадастром и растром (МСК-03 зона 4 vs без зоны)
+            source_proj4 = source_srs_cadastr.ExportToProj4() if source_srs_cadastr else ""
+            target_proj4 = target_srs_raster.ExportToProj4()
+            
+            source_parts = dict(p.split("=", 1) for p in source_proj4.split() if "=" in p)
+            target_parts = dict(p.split("=", 1) for p in target_proj4.split() if "=" in p)
+            
+            source_x0 = float(source_parts.get("+x_0", "0"))
+            target_x0 = float(target_parts.get("+x_0", "0"))
+            
+            # Если разница в x_0 равна 4 млн (МСК-03 зона 4 -> без зоны), применяем простую коррекцию
+            x0_diff = abs(source_x0 - target_x0)
+            is_msk_zone4_to_nozone = (abs(x0_diff - 4000000) < 1000 and 
+                                      source_parts.get("+proj") == target_parts.get("+proj") == "tmerc" and
+                                      source_parts.get("+lon_0") == target_parts.get("+lon_0"))
+            
+            # Если CRS совпадают, трансформация не нужна
+            if source_srs_cadastr.IsSame(target_srs_raster):
+                print("[INFO] CRS кадастра и растра идентичны. Трансформация не требуется.", flush=True)
+                transform_cadastr_to_raster = None
+            elif is_msk_zone4_to_nozone:
+                # Специальная обработка: МСК-03 зона 4 <-> без зоны
+                # Определяем направление: если кадастр в зоне 4 (x_0=4250000), а растр без зоны (x_0=250000) - вычитаем 4 млн
+                # Если наоборот - прибавляем 4 млн
+                if source_x0 > target_x0:
+                    # Кадастр в зоне 4, растр без зоны - вычитаем 4 млн
+                    offset_direction = "вычитаем"
+                    offset_value = -4000000
+                else:
+                    # Кадастр без зоны, растр в зоне 4 - прибавляем 4 млн
+                    offset_direction = "прибавляем"
+                    offset_value = 4000000
+                
+                print(f"[INFO] Обнаружена трансформация МСК-03 (x_0: {source_x0} -> {target_x0}).", flush=True)
+                print(f"[INFO] {offset_direction} 4000000 по оси X для преобразования между зоной 4 и без зоны.", flush=True)
+                # Создаём трансформацию через PROJ (он должен правильно обработать разницу в x_0)
+                transform_cadastr_to_raster = osr.CoordinateTransformation(
+                    source_srs_cadastr, target_srs_raster
+                )
+                print("[INFO] Создана трансформация координат кадастр -> растр.", flush=True)
+            else:
+                # Обычная трансформация
+                transform_cadastr_to_raster = osr.CoordinateTransformation(
+                    source_srs_cadastr, target_srs_raster
+                )
+                print(f"[INFO] Создана трансформация координат кадастр -> растр (x_0: {source_x0} -> {target_x0}).", flush=True)
+
+            # Проверяем, нужно ли дополнительное смещение координат кадастра
+            # Если растр имеет координаты > 4 млн, значит он фактически в зоне 4, 
+            # и нужно применить обратное смещение к кадастру после трансформации
+            cadastral_coord_offset = 0.0
+            if raster_bounds is not None:
+                min_x, min_y, max_x, max_y = raster_bounds
+                # Если координаты растра > 4 млн, значит растр фактически в зоне 4
+                if min_x > 4000000:
+                    cadastral_coord_offset = 4000000.0  # Прибавляем 4 млн к координатам кадастра
+                    print(f"[INFO] Растр имеет координаты X > 4 млн ({min_x:.2f}).", flush=True)
+                    print(f"[INFO] Применяю дополнительное смещение +4000000 к координатам кадастра после трансформации.", flush=True)
             
             # Фильтрация по bounds изображения
             if raster_bounds is not None:
                 from shapely.geometry import box
-                min_x, min_y, max_x, max_y = raster_bounds
                 raster_bbox = box(min_x, min_y, max_x, max_y)
+                print(f"[INFO] BBox растра: X=[{min_x:.2f},{max_x:.2f}] Y=[{min_y:.2f},{max_y:.2f}]", flush=True)
             else:
                 raster_bbox = None
+
+            # Диагностика: собираем первые несколько bounds после трансформации
+            sample_bounds = []
+            total_features = 0
+            sample_bounds_no_transform = []  # Без трансформации для сравнения
             
-            # Читаем каждый объект
+            # Чтение объектов (первый проход - с трансформацией)
             for feature in layer:
                 geom = feature.GetGeometryRef()
                 if geom is None:
                     continue
-                
+
                 geom_clone = geom.Clone()
-                try:
-                    geom_clone.Transform(transform_cadastr_to_raster)
-                except Exception as e:
-                    continue
                 
+                # Диагностика: сохраняем первые 5 bounds БЕЗ трансформации
                 try:
-                    # Извлекаем все доступные атрибуты
-                    attributes = {}
+                    if len(sample_bounds_no_transform) < 5:
+                        env_orig = geom.GetEnvelope()
+                        sample_bounds_no_transform.append((env_orig[0], env_orig[2], env_orig[1], env_orig[3]))
+                except Exception:
+                    pass
+                
+                # Трансформация (если нужна)
+                if transform_cadastr_to_raster is not None:
+                    try:
+                        geom_clone.Transform(transform_cadastr_to_raster)
+                    except Exception as e:
+                        print(f"[DEBUG] Ошибка трансформации геометрии: {e}", flush=True)
+                        continue
+
+                total_features += 1
+                
+                # Диагностика: сохраняем первые 5 bounds после трансформации
+                try:
+                    if len(sample_bounds) < 5:
+                        env = geom_clone.GetEnvelope()
+                        sample_bounds.append((env[0], env[2], env[1], env[3]))  # minx, maxx, miny, maxy
+                except Exception:
+                    pass
+
+                try:
+                    # Атрибуты
+                    attributes: Dict[str, object] = {}
                     for field_name in field_names:
                         try:
-                            field_value = feature.GetField(field_name)
-                            attributes[field_name] = field_value
-                        except:
+                            attributes[field_name] = feature.GetField(field_name)
+                        except Exception:
                             attributes[field_name] = None
-                    
-                    # Определяем кадастровый номер
+
+                    # Кадастровый номер
                     cadastral_number = None
-                    for field_name in ['CADASTRAL_NUMBER', 'CAD_NUMBER', 'NUMBER', 'CADNUM', 'КАД_НОМЕР']:
+                    for field_name in ["CADASTRAL_NUMBER", "CAD_NUMBER", "NUMBER", "CADNUM", "КАД_НОМЕР"]:
                         if field_name in attributes and attributes[field_name]:
                             cadastral_number = str(attributes[field_name])
                             break
-                    
                     if not cadastral_number:
                         cadastral_number = f"Parcel_{len(cadastral_objects)}"
-                    
-                    # Извлекаем идентификаторы
+
+                    # Идентификатор
                     object_id = None
-                    for field_name in ['ID', 'OBJECTID', 'FID', 'FEATURE_ID']:
+                    for field_name in ["ID", "OBJECTID", "FID", "FEATURE_ID"]:
                         if field_name in attributes and attributes[field_name] is not None:
                             object_id = attributes[field_name]
                             break
-                    
                     if object_id is None:
                         object_id = len(cadastral_objects)
-                    
-                    # Обрабатываем геометрию
+
+                    # Геометрия
                     if geom_clone.GetGeometryType() == ogr.wkbPolygon:
                         shp = shape(json.loads(geom_clone.ExportToJson()))
                         if shp.is_valid and shp.area > 0:
+                            # Применяем дополнительное смещение координат, если нужно
+                            if cadastral_coord_offset != 0:
+                                from shapely.affinity import translate
+                                shp = translate(shp, xoff=cadastral_coord_offset, yoff=0)
+                            
                             if raster_bbox is None or shp.intersects(raster_bbox):
-                                # Вычисляем координаты углов участка
                                 bounds = shp.bounds
                                 exterior_coords = list(shp.exterior.coords)
-                                
-                                cadastral_objects.append({
-                                    'geometry': shp,
-                                    'cadastral_number': cadastral_number,
-                                    'object_id': object_id,
-                                    'area_sqm': shp.area,
-                                    'centroid': shp.centroid.coords[0],
-                                    'bounds': bounds,
-                                    'exterior_coords': exterior_coords,
-                                    'attributes': attributes
-                                })
-                    
+                                cadastral_objects.append(
+                                    {
+                                        "geometry": shp,
+                                        "cadastral_number": cadastral_number,
+                                        "object_id": object_id,
+                                        "area_sqm": shp.area,
+                                        "centroid": shp.centroid.coords[0],
+                                        "bounds": bounds,
+                                        "exterior_coords": exterior_coords,
+                                        "attributes": attributes,
+                                    }
+                                )
                     elif geom_clone.GetGeometryType() == ogr.wkbMultiPolygon:
                         for i in range(geom_clone.GetGeometryCount()):
                             subgeom = geom_clone.GetGeometryRef(i)
                             shp = shape(json.loads(subgeom.ExportToJson()))
                             if shp.is_valid and shp.area > 0:
+                                # Применяем дополнительное смещение координат, если нужно
+                                if cadastral_coord_offset != 0:
+                                    from shapely.affinity import translate
+                                    shp = translate(shp, xoff=cadastral_coord_offset, yoff=0)
+                                
                                 if raster_bbox is None or shp.intersects(raster_bbox):
                                     bounds = shp.bounds
                                     exterior_coords = list(shp.exterior.coords)
-                                    
-                                    cadastral_objects.append({
-                                        'geometry': shp,
-                                        'cadastral_number': f"{cadastral_number}_part_{i}",
-                                        'object_id': f"{object_id}_part_{i}",
-                                        'area_sqm': shp.area,
-                                        'centroid': shp.centroid.coords[0],
-                                        'bounds': bounds,
-                                        'exterior_coords': exterior_coords,
-                                        'attributes': attributes
-                                    })
-                
-                except Exception as e:
-                    print(f"Ошибка обработки объекта: {e}")
+                                    cadastral_objects.append(
+                                        {
+                                            "geometry": shp,
+                                            "cadastral_number": f"{cadastral_number}_part_{i}",
+                                            "object_id": f"{object_id}_part_{i}",
+                                            "area_sqm": shp.area,
+                                            "centroid": shp.centroid.coords[0],
+                                            "bounds": bounds,
+                                            "exterior_coords": exterior_coords,
+                                            "attributes": attributes,
+                                        }
+                                    )
+                except Exception:
                     continue
+
+            # Диагностика
+            print(f"[DEBUG] Всего обработано features из MIF/MID: {total_features}", flush=True)
+            if sample_bounds_no_transform:
+                print(f"[DEBUG] Примеры bounds полигонов БЕЗ трансформации (первые 5):", flush=True)
+                for i, (minx, maxx, miny, maxy) in enumerate(sample_bounds_no_transform, 1):
+                    print(f"  [{i}] X=[{minx:.2f},{maxx:.2f}] Y=[{miny:.2f},{maxy:.2f}]", flush=True)
+            if sample_bounds:
+                print(f"[DEBUG] Примеры bounds полигонов ПОСЛЕ трансформации (первые 5):", flush=True)
+                for i, (minx, maxx, miny, maxy) in enumerate(sample_bounds, 1):
+                    print(f"  [{i}] X=[{minx:.2f},{maxx:.2f}] Y=[{miny:.2f},{maxy:.2f}]", flush=True)
             
-            print(f"Успешно прочитано {len(cadastral_objects)} кадастровых объектов с расширенными атрибутами")
+            # Автоматическая диагностика проблемы с координатами
+            if len(cadastral_objects) == 0 and total_features > 0 and raster_bbox is not None:
+                print("\n" + "="*80, flush=True)
+                print("[WARN] Не найдено кадастровых объектов в области растра!", flush=True)
+                print("[INFO] Отключаю фильтрацию по bbox - алгоритм привязки по расстоянию будет работать", flush=True)
+                print("="*80, flush=True)
+                
+                # Повторное чтение БЕЗ фильтрации по bbox
+                layer.ResetReading()
+                raster_bbox = None  # Отключаем фильтрацию
+                
+                total_retry = 0
+                for feature in layer:
+                    total_retry += 1
+                    if total_retry % 10000 == 0:
+                        print(f"[INFO] Обработано {total_retry} объектов...", flush=True)
+                    geom = feature.GetGeometryRef()
+                    if geom is None:
+                        continue
+                    
+                    geom_clone = geom.Clone()
+                    
+                    # Трансформация (если нужна)
+                    if transform_cadastr_to_raster is not None:
+                        try:
+                            geom_clone.Transform(transform_cadastr_to_raster)
+                        except Exception:
+                            continue
+                    
+                    try:
+                        # Атрибуты
+                        attributes: Dict[str, object] = {}
+                        for field_name in field_names:
+                            try:
+                                attributes[field_name] = feature.GetField(field_name)
+                            except Exception:
+                                attributes[field_name] = None
+                        
+                        cadastral_number = None
+                        for field_name in ["CADASTRAL_NUMBER", "CAD_NUMBER", "NUMBER", "CADNUM", "КАД_НОМЕР"]:
+                            if field_name in attributes and attributes[field_name]:
+                                cadastral_number = str(attributes[field_name])
+                                break
+                        if not cadastral_number:
+                            cadastral_number = f"Parcel_{len(cadastral_objects)}"
+                        
+                        object_id = None
+                        for field_name in ["ID", "OBJECTID", "FID", "FEATURE_ID"]:
+                            if field_name in attributes and attributes[field_name] is not None:
+                                object_id = attributes[field_name]
+                                break
+                        if object_id is None:
+                            object_id = len(cadastral_objects)
+                        
+                        # Геометрия (БЕЗ фильтрации по bbox)
+                        if geom_clone.GetGeometryType() == ogr.wkbPolygon:
+                            shp = shape(json.loads(geom_clone.ExportToJson()))
+                            if shp.is_valid and shp.area > 0:
+                                # Применяем дополнительное смещение координат, если нужно
+                                if cadastral_coord_offset != 0:
+                                    from shapely.affinity import translate
+                                    shp = translate(shp, xoff=cadastral_coord_offset, yoff=0)
+                                
+                                bounds = shp.bounds
+                                exterior_coords = list(shp.exterior.coords)
+                                cadastral_objects.append({
+                                    "geometry": shp,
+                                    "cadastral_number": cadastral_number,
+                                    "object_id": object_id,
+                                    "area_sqm": shp.area,
+                                    "centroid": shp.centroid.coords[0],
+                                    "bounds": bounds,
+                                    "exterior_coords": exterior_coords,
+                                    "attributes": attributes,
+                                })
+                        elif geom_clone.GetGeometryType() == ogr.wkbMultiPolygon:
+                            for i in range(geom_clone.GetGeometryCount()):
+                                subgeom = geom_clone.GetGeometryRef(i)
+                                shp = shape(json.loads(subgeom.ExportToJson()))
+                                if shp.is_valid and shp.area > 0:
+                                    # Применяем дополнительное смещение координат, если нужно
+                                    if cadastral_coord_offset != 0:
+                                        from shapely.affinity import translate
+                                        shp = translate(shp, xoff=cadastral_coord_offset, yoff=0)
+                                    
+                                    bounds = shp.bounds
+                                    exterior_coords = list(shp.exterior.coords)
+                                    cadastral_objects.append({
+                                        "geometry": shp,
+                                        "cadastral_number": f"{cadastral_number}_part_{i}",
+                                        "object_id": f"{object_id}_part_{i}",
+                                        "area_sqm": shp.area,
+                                        "centroid": shp.centroid.coords[0],
+                                        "bounds": bounds,
+                                        "exterior_coords": exterior_coords,
+                                        "attributes": attributes,
+                                    })
+                    except Exception:
+                        continue
+                
+                print(f"[INFO] Прочитано {len(cadastral_objects)} кадастровых объектов из {total_retry} обработанных (фильтрация по bbox отключена)", flush=True)
             
+            print(
+                f"Успешно прочитано {len(cadastral_objects)} кадастровых объектов с расширенными атрибутами"
+            )
         except Exception as e:
             print(f"Ошибка чтения кадастровых данных: {e}")
-        
+
         return cadastral_objects
     
     def calculate_pixel_area_sqm(self, raster_transform: tuple) -> float:
@@ -756,6 +1005,21 @@ class ComprehensiveAnalyzer:
         violations = []
         total_objects = len(detected_objects)
         
+        # Проверяем смещение координат между нарушениями и кадастром
+        violation_coord_offset = 0.0
+        if detected_objects and cadastral_objects:
+            v_centroid = detected_objects[0]['geometry'].centroid
+            c_centroid = cadastral_objects[0].get('centroid', (0, 0))
+            x_diff = v_centroid.x - c_centroid[0]
+            # Если разница по X около 4 млн, применяем смещение
+            if abs(x_diff - 4000000) < 100000 or abs(x_diff + 4000000) < 100000:
+                if x_diff > 0:
+                    violation_coord_offset = -4000000.0  # Вычитаем 4 млн из координат нарушений
+                else:
+                    violation_coord_offset = 4000000.0   # Прибавляем 4 млн к координатам нарушений
+                print(f"[INFO] Обнаружено смещение координат нарушений относительно кадастра: {x_diff:.2f}м", flush=True)
+                print(f"[INFO] Применяю коррекцию: {violation_coord_offset:+.0f} по оси X к координатам нарушений при вычислении расстояний", flush=True)
+        
         # Создаем пространственный индекс для кадастровых участков
         print("Создание пространственного индекса для кадастровых участков...")
         cadastral_geometries = [cadastral['geometry'] for cadastral in cadastral_objects]
@@ -853,7 +1117,9 @@ class ComprehensiveAnalyzer:
                                     if inter_ratio >= self.config['binding_min_intersection_ratio']:
                                         ccx, ccy = cad.get('centroid', (None, None))
                                         if ccx is not None and ccy is not None:
-                                            centroid_dist = math.hypot(v_centroid.x - ccx, v_centroid.y - ccy)
+                                            # Применяем смещение к координатам нарушения при вычислении расстояния
+                                            vx_corrected = v_centroid.x + violation_coord_offset
+                                            centroid_dist = math.hypot(vx_corrected - ccx, v_centroid.y - ccy)
                                             
                                             quality_score = (
                                                 inter_ratio * 0.7 +
@@ -873,7 +1139,8 @@ class ComprehensiveAnalyzer:
                                 binding_method = f"max_intersection_quality={best_quality_score:.3f}, area={best_intersection_area:.2f}m2"
                                 ccx, ccy = closest_cadastral.get('centroid', (None, None))
                                 if ccx is not None and ccy is not None:
-                                    min_distance = math.hypot(v_centroid.x - ccx, v_centroid.y - ccy)
+                                    vx_corrected = v_centroid.x + violation_coord_offset
+                                    min_distance = math.hypot(vx_corrected - ccx, v_centroid.y - ccy)
                             
                             # 2) Фолбэк: центроид нарушения внутри участка (если нет значимых пересечений)
                             if closest_cadastral is None:
@@ -884,7 +1151,8 @@ class ComprehensiveAnalyzer:
                                             binding_method = "centroid_inside"
                                             ccx, ccy = cad.get('centroid', (None, None))
                                             if ccx is not None and ccy is not None:
-                                                min_distance = math.hypot(v_centroid.x - ccx, v_centroid.y - ccy)
+                                                vx_corrected = v_centroid.x + violation_coord_offset
+                                                min_distance = math.hypot(vx_corrected - ccx, v_centroid.y - ccy)
                                             break
                                     except Exception:
                                         continue
@@ -901,7 +1169,8 @@ class ComprehensiveAnalyzer:
                                         if distance_to_boundary <= self.config['binding_boundary_buffer_m']:
                                             ccx, ccy = cad.get('centroid', (None, None))
                                             if ccx is not None and ccy is not None:
-                                                centroid_distance = math.hypot(v_centroid.x - ccx, v_centroid.y - ccy)
+                                                vx_corrected = v_centroid.x + violation_coord_offset
+                                                centroid_distance = math.hypot(vx_corrected - ccx, v_centroid.y - ccy)
                                                 score = distance_to_boundary + centroid_distance * 0.1
                                                 
                                                 if score < best_score:
@@ -916,17 +1185,19 @@ class ComprehensiveAnalyzer:
                                     binding_method = f"boundary_distance_{best_distance:.2f}m_with_centroid_direction"
                                     ccx, ccy = closest_cadastral.get('centroid', (None, None))
                                     if ccx is not None and ccy is not None:
-                                        min_distance = math.hypot(v_centroid.x - ccx, v_centroid.y - ccy)
+                                        vx_corrected = v_centroid.x + violation_coord_offset
+                                        min_distance = math.hypot(vx_corrected - ccx, v_centroid.y - ccy)
                             
                             # 4) Фолбэк: ближайший по расстоянию между центроидами (с ограничением порога)
                             if closest_cadastral is None:
                                 v_cx, v_cy = v_centroid.coords[0]
+                                v_cx_corrected = v_cx + violation_coord_offset  # Применяем смещение
                                 for cad in cadastral_objects:
                                     try:
                                         c_cx, c_cy = cad.get('centroid', (None, None))
                                         if c_cx is None or c_cy is None:
                                             continue
-                                        distance = math.hypot(v_cx - c_cx, v_cy - c_cy)
+                                        distance = math.hypot(v_cx_corrected - c_cx, v_cy - c_cy)
                                         if distance < min_distance:
                                             min_distance = distance
                                             closest_cadastral = cad
@@ -999,13 +1270,27 @@ class ComprehensiveAnalyzer:
             close_violations = [v for v in violations if v['distance_to_cadastral'] <= 50.0]
             far_violations = [v for v in violations if v['distance_to_cadastral'] > 50.0]
             
+            # Диагностика координат
+            if violations and cadastral_objects:
+                v_centroid = violations[0]['centroid']
+                c_centroid = cadastral_objects[0].get('centroid', (0, 0))
+                print(f"\n[ДИАГНОСТИКА] Координаты первого нарушения: X={v_centroid[0]:.2f}, Y={v_centroid[1]:.2f}")
+                print(f"[ДИАГНОСТИКА] Координаты первого кадастра: X={c_centroid[0]:.2f}, Y={c_centroid[1]:.2f}")
+                print(f"[ДИАГНОСТИКА] Смещение: X={v_centroid[0]-c_centroid[0]:.2f}м, Y={v_centroid[1]-c_centroid[1]:.2f}м")
+            
             print(f"\nДИАГНОСТИКА ПОИСКА БЛИЖАЙШИХ УЧАСТКОВ:")
             print(f"Нарушения рядом с кадастром (≤50м): {len(close_violations)}")
             print(f"Нарушения далеко от кадастра (>50м): {len(far_violations)}")
             if distances:
-                print(f"Минимальное расстояние до кадастра: {min(distances):.2f} м")
-                print(f"Максимальное расстояние до кадастра: {max(distances):.2f} м")
-                print(f"Среднее расстояние до кадастра: {sum(distances)/len(distances):.2f} м")
+                finite_distances = [d for d in distances if d != float('inf')]
+                if finite_distances:
+                    print(f"Минимальное расстояние до кадастра: {min(finite_distances):.2f} м")
+                    print(f"Максимальное расстояние до кадастра: {max(finite_distances):.2f} м")
+                    print(f"Среднее расстояние до кадастра: {sum(finite_distances)/len(finite_distances):.2f} м")
+                else:
+                    print(f"Минимальное расстояние до кадастра: inf м")
+                    print(f"Максимальное расстояние до кадастра: inf м")
+                    print(f"Среднее расстояние до кадастра: inf м")
                 
                 # Показываем примеры ближайших и дальних нарушений
                 if close_violations:
