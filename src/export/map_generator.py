@@ -1,0 +1,576 @@
+"""
+Генерация карт для документов по участкам (zoom и overview карты).
+"""
+
+import logging
+import warnings
+from io import BytesIO
+from typing import Optional, Tuple, Any, List
+import math
+import os
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from matplotlib.patches import PathPatch
+from matplotlib.path import Path as MplPath
+import numpy as np
+import pandas as pd
+
+from shapely import wkt as shapely_wkt
+from shapely.geometry import Polygon, MultiPolygon, box
+from shapely.ops import transform, unary_union
+
+try:
+    from PIL import Image as PILImage
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+
+try:
+    import pyproj
+    PYPROJ_AVAILABLE = True
+except ImportError:
+    PYPROJ_AVAILABLE = False
+
+from .coordinate_presenter import simplify_points
+
+logger = logging.getLogger(__name__)
+
+
+class MapGenerator:
+    """Генератор карт для документов по участкам."""
+    
+    def __init__(self, background: Optional[Tuple[Any, Optional[Tuple[float, float, float, float]], Any]] = None):
+        """
+        Args:
+            background: Предзагруженный фон (img_array, extent, crs)
+        """
+        self.background = background
+    
+    def create_zoom_map(
+        self,
+        cadastral_number: str,
+        cadastral_df: pd.DataFrame,
+        violations_df: pd.DataFrame,
+        viol_coords_df: pd.DataFrame,
+        save_path: str,
+        proj_string: Optional[str] = None,
+        min_point_spacing: float = 3.0,
+        max_points: Optional[int] = None
+    ) -> None:
+        """
+        Создаёт zoom-карту с увеличением на нарушения конкретного участка.
+        
+        Args:
+            cadastral_number: Кадастровый номер участка
+            cadastral_df: DataFrame с кадастровыми участками
+            violations_df: DataFrame с нарушениями
+            viol_coords_df: DataFrame с координатами нарушений
+            save_path: Путь для сохранения PNG
+            proj_string: PROJ-строка исходной СК (опционально)
+            min_point_spacing: Минимальное расстояние между точками
+            max_points: Максимальное количество точек
+        """
+        v = violations_df[violations_df['Ближайший кадастровый номер'] == cadastral_number]
+        if v.empty:
+            return
+
+        # Попытка взять WKT геометрий нарушений
+        geoms = []
+        if 'WKT геометрии' in v.columns:
+            for w in v['WKT геометрии'].dropna().astype(str).tolist():
+                try:
+                    geom = shapely_wkt.loads(w)
+                    geoms.append(geom)
+                except Exception:
+                    pass
+
+        if not geoms:
+            return
+
+        # Контур участка
+        parcel_geom = self._get_parcel_geometry(cadastral_number, cadastral_df)
+
+        fig, ax = plt.subplots(figsize=(5, 5), dpi=130)
+
+        # Перепроецирование
+        project = self._setup_projection(proj_string)
+        if project:
+            try:
+                geoms = [transform(project, g) for g in geoms]
+                if parcel_geom:
+                    parcel_geom = transform(project, parcel_geom)
+            except Exception as e:
+                logger.warning(f"Ошибка при перепроецировании геометрий: {e}")
+                return
+
+        # Подложка
+        self._draw_background(ax)
+
+        # Контур участка
+        if parcel_geom is not None and not parcel_geom.is_empty:
+            self._plot_shapely(ax, parcel_geom, facecolor='none', edgecolor='blue', linewidth=0.8, alpha=0.9)
+
+        # Нарушения
+        for g in geoms:
+            self._plot_shapely(ax, g, facecolor='red', edgecolor='darkred', linewidth=0.5, alpha=0.6)
+
+        # Центроиды нарушений
+        self._draw_centroids(ax, v, project)
+
+        # Нумерация точек
+        self._draw_violation_points(
+            ax, cadastral_number, violations_df, viol_coords_df, 
+            project, min_point_spacing, max_points
+        )
+
+        # Масштаб
+        self._set_zoom_scale(ax, geoms, parcel_geom)
+
+        ax.set_aspect('equal', adjustable='box')
+        ax.axis('off')
+
+        # Сохранение
+        self._save_figure(fig, save_path, cadastral_number, 'zoom')
+    
+    def create_overview_map(
+        self,
+        cadastral_number: str,
+        cadastral_df: pd.DataFrame,
+        violations_df: pd.DataFrame,
+        viol_coords_df: pd.DataFrame,
+        save_path: str,
+        proj_string: Optional[str] = None,
+        min_point_spacing: float = 3.0,
+        max_points: Optional[int] = None
+    ) -> None:
+        """
+        Создаёт обзорную карту участка с окружением.
+        
+        Args:
+            cadastral_number: Кадастровый номер участка
+            cadastral_df: DataFrame с кадастровыми участками
+            violations_df: DataFrame с нарушениями
+            viol_coords_df: DataFrame с координатами нарушений
+            save_path: Путь для сохранения PNG
+            proj_string: PROJ-строка исходной СК (опционально)
+            min_point_spacing: Минимальное расстояние между точками
+            max_points: Максимальное количество точек
+        """
+        v = violations_df[violations_df['Ближайший кадастровый номер'] == cadastral_number]
+        
+        cad_rows = cadastral_df[cadastral_df['Кадастровый номер'] == cadastral_number]
+        if cad_rows.empty:
+            return
+        
+        cad_row = cad_rows.iloc[0]
+        parcel_geom = self._get_parcel_geometry(cadastral_number, cadastral_df)
+        
+        if parcel_geom is None or parcel_geom.is_empty:
+            return
+        
+        # Геометрии нарушений
+        geoms = []
+        if not v.empty and 'WKT геометрии' in v.columns:
+            for w in v['WKT геометрии'].dropna().astype(str).tolist():
+                try:
+                    geom = shapely_wkt.loads(w)
+                    geoms.append(geom)
+                except Exception:
+                    pass
+        
+        # Область интереса с буфером
+        area_of_interest = parcel_geom
+        buffer_distance = 0
+        if geoms:
+            all_geoms_combined = unary_union([parcel_geom] + geoms)
+            buffer_distance = max(
+                parcel_geom.bounds[2] - parcel_geom.bounds[0],
+                parcel_geom.bounds[3] - parcel_geom.bounds[1]
+            ) * 0.3
+            area_of_interest = all_geoms_combined.buffer(buffer_distance)
+        
+        # Соседние участки
+        all_cadastral_info = self._get_neighboring_parcels(
+            cadastral_number, cadastral_df, area_of_interest, buffer_distance
+        )
+        
+        fig, ax = plt.subplots(figsize=(8, 8), dpi=150)
+        
+        # Перепроецирование
+        project = self._setup_projection(proj_string)
+        if project:
+            try:
+                parcel_geom = transform(project, parcel_geom)
+                geoms = [transform(project, g) for g in geoms]
+                for info in all_cadastral_info:
+                    info['geom'] = transform(project, info['geom'])
+            except Exception:
+                return
+        
+        # Подложка
+        self._draw_background(ax)
+        
+        # Все участки
+        for info in all_cadastral_info:
+            if info['is_main']:
+                self._plot_shapely(ax, info['geom'], facecolor='lightblue', edgecolor='blue', linewidth=2.0, alpha=0.4)
+            else:
+                self._plot_shapely(ax, info['geom'], facecolor='lightyellow', edgecolor='orange', linewidth=1.5, alpha=0.3)
+        
+        # Подпись участка
+        cadastral_area = self._get_cadastral_area(cad_row)
+        total_violation_area = float(v['Площадь нарушения, м²'].fillna(0).sum()) if not v.empty else 0
+        
+        centroid = parcel_geom.centroid
+        ax.text(
+            centroid.x, centroid.y, 
+            f"КН: {cadastral_number}\nПлощадь: {cadastral_area:.2f} м²\nНарушений: {total_violation_area:.2f} м²",
+            fontsize=8, color='blue', ha='center', va='center',
+            bbox=dict(boxstyle='round,pad=0.5', facecolor='white', edgecolor='blue', alpha=0.9)
+        )
+        
+        # Нарушения
+        for g in geoms:
+            self._plot_shapely(ax, g, facecolor='red', edgecolor='darkred', linewidth=1.0, alpha=0.5)
+        
+        # Нумерация точек нарушений
+        self._draw_violation_labels(
+            ax, cadastral_number, violations_df, viol_coords_df,
+            project, min_point_spacing, max_points
+        )
+        
+        # Масштаб
+        self._set_overview_scale(ax, all_cadastral_info, geoms)
+        
+        ax.set_aspect('equal', adjustable='box')
+        ax.set_title(f'Обзорная карта участка {cadastral_number}', fontsize=10, weight='bold')
+        ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
+        
+        # Сохранение
+        self._save_figure(fig, save_path, cadastral_number, 'overview', figsize=(6.0, 6.0))
+    
+    # === Вспомогательные методы ===
+    
+    def _get_parcel_geometry(self, cadastral_number: str, cadastral_df: pd.DataFrame) -> Optional[Polygon]:
+        """Извлекает геометрию участка из DataFrame."""
+        if 'WKT геометрии' not in cadastral_df.columns:
+            return None
+        
+        cad_rows = cadastral_df[cadastral_df['Кадастровый номер'] == cadastral_number]
+        if cad_rows.empty:
+            return None
+        
+        try:
+            return shapely_wkt.loads(str(cad_rows.iloc[0]['WKT геометрии']))
+        except Exception:
+            return None
+    
+    def _setup_projection(self, proj_string: Optional[str]):
+        """Настраивает трансформацию координат."""
+        if self.background is None or proj_string is None:
+            return None
+        
+        if not PYPROJ_AVAILABLE:
+            logger.warning("Пакет 'pyproj' не найден. Пропускаю перепроецирование.")
+            return None
+        
+        try:
+            _, _, dest_crs = self.background
+            if dest_crs:
+                src_crs = pyproj.CRS.from_proj4(proj_string)
+                transformer = pyproj.Transformer.from_crs(src_crs, dest_crs, always_xy=True)
+                return transformer.transform
+        except Exception as e:
+            logger.warning(f"Не удалось создать трансформацию координат: {e}")
+            return None
+    
+    def _draw_background(self, ax):
+        """Рисует фоновое изображение."""
+        if self.background is None:
+            return
+        
+        try:
+            bg_img, bg_extent, _ = self.background
+            if bg_img is not None:
+                if bg_extent is not None:
+                    left, right, bottom, top = bg_extent
+                    ax.imshow(bg_img, extent=[left, right, bottom, top], alpha=0.8)
+                else:
+                    ax.imshow(bg_img)
+        except Exception:
+            pass
+    
+    def _draw_centroids(self, ax, violations_df: pd.DataFrame, project):
+        """Рисует центроиды нарушений."""
+        if 'Центроид X' not in violations_df.columns or 'Центроид Y' not in violations_df.columns:
+            return
+        
+        for _, row in violations_df.iterrows():
+            try:
+                cx = pd.to_numeric(row['Центроид X'], errors='coerce')
+                cy = pd.to_numeric(row['Центроид Y'], errors='coerce')
+                if pd.notna(cx) and pd.notna(cy):
+                    if project:
+                        cx, cy = project(cx, cy)
+                    ax.plot(cx, cy, marker='+', markersize=6, color='yellow', markeredgewidth=1.5)
+            except Exception:
+                pass
+    
+    def _draw_violation_points(
+        self, ax, cadastral_number: str, violations_df: pd.DataFrame,
+        viol_coords_df: pd.DataFrame, project, min_spacing: float, max_pts: Optional[int]
+    ):
+        """Рисует нумерованные точки нарушений."""
+        vs_all = violations_df[violations_df['Ближайший кадастровый номер'] == cadastral_number]
+        if vs_all.empty or viol_coords_df.empty or '№ нарушения' not in viol_coords_df.columns:
+            return
+        
+        try:
+            vs = vs_all.reset_index(drop=True)
+            for local_idx, (idx_row, row_v) in enumerate(vs.iterrows(), 1):
+                global_v_num = row_v.get('№ нарушения', idx_row + 1)
+                try:
+                    global_v_num = int(global_v_num)
+                except Exception:
+                    global_v_num = idx_row + 1
+                
+                sub = viol_coords_df[viol_coords_df['№ нарушения'] == global_v_num].copy()
+                if sub.empty:
+                    continue
+                
+                sub.sort_values(by='Номер точки', inplace=True)
+                pts = list(zip(
+                    pd.to_numeric(sub['X'], errors='coerce').astype(float),
+                    pd.to_numeric(sub['Y'], errors='coerce').astype(float)
+                ))
+                
+                if project and pts:
+                    try:
+                        pts = [project(x, y) for (x, y) in pts]
+                    except Exception:
+                        continue
+                
+                if len(pts) >= 2 and pts[0] == pts[-1]:
+                    pts = pts[:-1]
+                
+                pts_simplified = simplify_points(pts, min_spacing=min_spacing, max_points=max_pts)
+                logger.debug(f"КН {cadastral_number}, Нарушение №{local_idx}: {len(pts)} -> {len(pts_simplified)} точек")
+                
+                for i, (x, y) in enumerate(pts_simplified, 1):
+                    ax.plot([x], [y], marker='o', markersize=2, color='darkred')
+                    ax.text(
+                        x, y, str(i), fontsize=5, color='darkred', ha='center', va='bottom',
+                        bbox=dict(boxstyle='round,pad=0.1', facecolor='white', edgecolor='none', alpha=0.8)
+                    )
+        except Exception:
+            pass
+    
+    def _draw_violation_labels(
+        self, ax, cadastral_number: str, violations_df: pd.DataFrame,
+        viol_coords_df: pd.DataFrame, project, min_spacing: float, max_pts: Optional[int]
+    ):
+        """Рисует подписи нарушений на обзорной карте."""
+        vs_all = violations_df[violations_df['Ближайший кадастровый номер'] == cadastral_number]
+        if vs_all.empty or viol_coords_df.empty or '№ нарушения' not in viol_coords_df.columns:
+            return
+        
+        try:
+            vs = vs_all.reset_index(drop=True)
+            for local_idx, (idx_row, row_v) in enumerate(vs.iterrows(), 1):
+                global_v_num = row_v.get('№ нарушения', idx_row + 1)
+                try:
+                    global_v_num = int(global_v_num)
+                except Exception:
+                    global_v_num = idx_row + 1
+                
+                sub = viol_coords_df[viol_coords_df['№ нарушения'] == global_v_num].copy()
+                if sub.empty:
+                    continue
+                
+                sub.sort_values(by='Номер точки', inplace=True)
+                pts = list(zip(
+                    pd.to_numeric(sub['X'], errors='coerce').astype(float),
+                    pd.to_numeric(sub['Y'], errors='coerce').astype(float)
+                ))
+                
+                if project and pts:
+                    try:
+                        pts = [project(x, y) for (x, y) in pts]
+                    except Exception:
+                        continue
+                
+                if len(pts) >= 2 and pts[0] == pts[-1]:
+                    pts = pts[:-1]
+                
+                pts_simplified = simplify_points(pts, min_spacing=min_spacing, max_points=max_pts)
+                
+                violation_area = row_v.get('Площадь нарушения, м²', 0)
+                try:
+                    violation_area = float(pd.to_numeric(violation_area, errors='coerce'))
+                except Exception:
+                    violation_area = 0
+                
+                if pts_simplified:
+                    centroid_x = sum(p[0] for p in pts_simplified) / len(pts_simplified)
+                    centroid_y = sum(p[1] for p in pts_simplified) / len(pts_simplified)
+                    ax.text(
+                        centroid_x, centroid_y, 
+                        f"№{local_idx}\n{violation_area:.1f} м²",
+                        fontsize=7, color='white', ha='center', va='center', weight='bold',
+                        bbox=dict(boxstyle='round,pad=0.3', facecolor='red', edgecolor='darkred', alpha=0.8)
+                    )
+                
+                for i, (x, y) in enumerate(pts_simplified, 1):
+                    ax.plot([x], [y], marker='o', markersize=2.5, color='yellow', markeredgecolor='darkred', markeredgewidth=0.5)
+                    ax.text(x, y, str(i), fontsize=5, color='black', ha='center', va='center', weight='bold')
+        except Exception:
+            pass
+    
+    def _get_neighboring_parcels(
+        self, cadastral_number: str, cadastral_df: pd.DataFrame, 
+        area_of_interest, buffer_distance: float
+    ) -> List[dict]:
+        """Получает список соседних участков."""
+        all_cadastral_info = []
+        
+        if 'WKT геометрии' not in cadastral_df.columns:
+            return all_cadastral_info
+        
+        for idx, row in cadastral_df.iterrows():
+            try:
+                cad_num = row.get('Кадастровый номер', '')
+                if pd.isna(cad_num):
+                    continue
+                
+                geom = shapely_wkt.loads(str(row['WKT геометрии']))
+                if geom and not geom.is_empty:
+                    is_main = (str(cad_num) == str(cadastral_number))
+                    if is_main or geom.intersects(area_of_interest) or geom.distance(area_of_interest) < buffer_distance * 0.5:
+                        all_cadastral_info.append({
+                            'number': str(cad_num),
+                            'geom': geom,
+                            'is_main': is_main
+                        })
+            except Exception:
+                pass
+        
+        return all_cadastral_info
+    
+    def _get_cadastral_area(self, cad_row) -> float:
+        """Извлекает площадь участка."""
+        cadastral_area = cad_row.get('Площадь, м²', 0)
+        try:
+            return float(pd.to_numeric(cadastral_area, errors='coerce'))
+        except Exception:
+            return 0.0
+    
+    def _set_zoom_scale(self, ax, geoms: List, parcel_geom):
+        """Устанавливает масштаб для zoom-карты."""
+        all_bounds = [g.bounds for g in geoms if g and not g.is_empty]
+        if parcel_geom is not None and not parcel_geom.is_empty:
+            all_bounds.append(parcel_geom.bounds)
+        
+        if not all_bounds:
+            return
+        
+        minx = min(b[0] for b in all_bounds)
+        miny = min(b[1] for b in all_bounds)
+        maxx = max(b[2] for b in all_bounds)
+        maxy = max(b[3] for b in all_bounds)
+        
+        padding_x = (maxx - minx) * 1.0 if maxx > minx else 50
+        padding_y = (maxy - miny) * 1.0 if maxy > miny else 50
+        ax.set_xlim(minx - padding_x, maxx + padding_x)
+        ax.set_ylim(miny - padding_y, maxy + padding_y)
+    
+    def _set_overview_scale(self, ax, all_cadastral_info: List[dict], geoms: List):
+        """Устанавливает масштаб для обзорной карты."""
+        all_bounds = []
+        for info in all_cadastral_info:
+            if info['geom'] and not info['geom'].is_empty:
+                all_bounds.append(info['geom'].bounds)
+        for g in geoms:
+            if g and not g.is_empty:
+                all_bounds.append(g.bounds)
+        
+        if not all_bounds:
+            return
+        
+        minx = min(b[0] for b in all_bounds)
+        miny = min(b[1] for b in all_bounds)
+        maxx = max(b[2] for b in all_bounds)
+        maxy = max(b[3] for b in all_bounds)
+        
+        padding_x = (maxx - minx) * 0.2
+        padding_y = (maxy - miny) * 0.2
+        ax.set_xlim(minx - padding_x, maxx + padding_x)
+        ax.set_ylim(miny - padding_y, maxy + padding_y)
+    
+    def _save_figure(
+        self, fig, save_path: str, cadastral_number: str, map_type: str,
+        figsize: Tuple[float, float] = (4.0, 4.0), dpi: int = 200
+    ):
+        """Сохраняет фигуру с контролем размера."""
+        max_pixels = 65536
+        fig.set_size_inches(*figsize)
+        
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            try:
+                plt.tight_layout(pad=0.5 if map_type == 'zoom' else 0.7)
+            except Exception:
+                pass
+        
+        try:
+            if PIL_AVAILABLE:
+                buf = BytesIO()
+                fig.savefig(buf, format='png', dpi=dpi)
+                buf.seek(0)
+                
+                img = PILImage.open(buf)
+                width, height = img.size
+                
+                if width > max_pixels or height > max_pixels:
+                    scale = min(max_pixels / width, max_pixels / height)
+                    new_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+                    logger.debug(f"Pillow {map_type}: уменьшаю {width}x{height} до {new_size[0]}x{new_size[1]}")
+                    try:
+                        img = img.resize(new_size, PILImage.Resampling.LANCZOS)
+                    except AttributeError:
+                        img = img.resize(new_size, PILImage.LANCZOS)
+                
+                img.save(save_path, 'PNG', optimize=True)
+                buf.close()
+            else:
+                fig.savefig(save_path, dpi=dpi)
+        except Exception as e:
+            logger.warning(f"Не удалось сохранить {map_type}-карту для {cadastral_number}: {e}")
+        finally:
+            plt.close(fig)
+    
+    @staticmethod
+    def _plot_shapely(ax, geom, facecolor='none', edgecolor='black', linewidth=1.0, alpha=1.0):
+        """Рисует геометрию Shapely на matplotlib axes."""
+        if geom is None or geom.is_empty:
+            return
+        
+        if isinstance(geom, MultiPolygon):
+            for g in geom.geoms:
+                MapGenerator._plot_shapely(ax, g, facecolor, edgecolor, linewidth, alpha)
+            return
+        
+        if isinstance(geom, Polygon):
+            exterior = np.asarray(geom.exterior.coords)
+            verts = exterior.tolist()
+            codes = [MplPath.MOVETO] + [MplPath.LINETO] * (len(exterior) - 2) + [MplPath.CLOSEPOLY]
+            
+            for interior in geom.interiors:
+                ring = np.asarray(interior.coords)
+                verts.extend(ring.tolist())
+                codes.extend([MplPath.MOVETO] + [MplPath.LINETO] * (len(ring) - 2) + [MplPath.CLOSEPOLY])
+            
+            path = MplPath(verts, codes)
+            patch = PathPatch(path, facecolor=facecolor, edgecolor=edgecolor, linewidth=linewidth, alpha=alpha)
+            ax.add_patch(patch)

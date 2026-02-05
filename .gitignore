@@ -1,5 +1,5 @@
 /comprehensive_output
 /detectron2
-/__pycache__
+__pycache__/
 
 /output
