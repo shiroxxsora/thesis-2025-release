@@ -131,7 +131,10 @@ class PDFBuilder:
         """Добавляет сводку по нарушениям."""
         sum_violation = float(violations_df['Площадь нарушения, м²'].fillna(0).sum())
         story.append(Paragraph(f"Количество нарушений: <b>{len(violations_df)}</b>", normal))
-        story.append(Paragraph(f"Суммарная площадь нарушений: <b>{format_float(sum_violation, 2)}</b> м²", normal))
+        story.append(Paragraph(
+            f"Площадь нарушений по участку (объединение контуров): <b>{format_float(sum_violation, 2)}</b> м²",
+            normal,
+        ))
         story.append(Spacer(1, 6))
         
         # Краткая таблица нарушений

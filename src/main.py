@@ -14,6 +14,10 @@ from .analysis import ViolationAnalyzer
 from .visualization import MapVisualizer
 from .reporting import PDFReportGenerator
 from .export import ParcelExporter
+from .utils.document_geometry import (
+    cadastral_parcels_for_maps_and_documents,
+    violations_for_maps_and_documents,
+)
 
 
 class ComprehensiveAnalyzer:
@@ -108,13 +112,23 @@ class ComprehensiveAnalyzer:
             cadastral_parcels,
             geotiff_data
         )
+
+        # Упрощение контуров кадастра и нарушений — одни и те же данные: Excel, per_parcel, карта
+        cadastral_docs = cadastral_parcels_for_maps_and_documents(
+            cadastral_parcels, self.config.simplify_tolerance_m
+        )
+        violations_docs = violations_for_maps_and_documents(
+            violations, self.config.simplify_tolerance_m
+        )
         
         # 6. Экспорт результатов
         self.logger.info("\n[6/9] Экспорт результатов...")
         self._export_results(
             detected_objects,
             cadastral_parcels,
+            cadastral_docs,
             violations,
+            violations_docs,
             geotiff_data
         )
         
@@ -123,16 +137,16 @@ class ComprehensiveAnalyzer:
         self.visualizer.create_overview_map(
             geotiff_data,
             detected_objects,
-            cadastral_parcels,
-            violations
+            cadastral_docs,
+            violations_docs
         )
         
         # 8. Генерация отчётов
         self.logger.info("\n[8/9] Генерация общего PDF отчёта...")
         self.pdf_generator.generate(
             detected_objects,
-            cadastral_parcels,
-            violations,
+            cadastral_docs,
+            violations_docs,
             geotiff_data
         )
         
@@ -161,13 +175,15 @@ class ComprehensiveAnalyzer:
         self,
         detected_objects,
         cadastral_parcels,
+        cadastral_docs,
         violations,
+        violations_docs,
         geotiff_data
     ):
         """Экспортирует результаты во все форматы."""
         output_dir = Path(self.config.output_dir)
         
-        # Shapefile
+        # Shapefile — полная геометрия анализа
         self.shapefile_writer.write(
             detected_objects,
             str(output_dir / 'detected_objects.shp'),
@@ -184,12 +200,12 @@ class ComprehensiveAnalyzer:
             crs=geotiff_data.crs
         )
         
-        # Excel
+        # Excel: те же упрощённые контуры, что на глобальной карте и в per_parcel
         self.excel_writer.write(
             detected_objects,
-            cadastral_parcels,
-            violations,
-            str(output_dir / 'report.xlsx')
+            cadastral_docs,
+            violations_docs,
+            str(output_dir / 'report.xlsx'),
         )
         
         # JSON

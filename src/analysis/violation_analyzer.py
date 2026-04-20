@@ -1,10 +1,12 @@
 """Анализатор нарушений."""
 
 import logging
+from collections import defaultdict
 import numpy as np
 import cv2
 from typing import List, Optional, Tuple
 from shapely.geometry import Polygon, box
+from shapely.ops import unary_union
 
 from ..domain.models import DetectedObject, CadastralParcel, Violation, GeoTiffData
 from ..analysis.cadastral_matcher import CadastralMatcher
@@ -45,7 +47,8 @@ class ViolationAnalyzer:
             geotiff_data: Данные GeoTIFF (для mask-based анализа)
             
         Returns:
-            Список нарушений
+            Список нарушений: по одному на кадастровый участок (геометрия — unary_union
+            фрагментов вне кадастра), без суммирования пересекающихся частей.
         """
         logger.info("Начинаю анализ нарушений...")
         
@@ -63,9 +66,13 @@ class ViolationAnalyzer:
             detected_objects,
             cadastral_parcels
         )
-        
-        logger.info(f"Найдено {len(violations)} нарушений")
-        return violations
+        merged = self._merge_violations_one_per_cadastral_parcel(violations)
+        logger.info(
+            "Нарушений после union по кадастру: %s (фрагментов по объектам до объединения: %s)",
+            len(merged),
+            len(violations),
+        )
+        return merged
     
     def _analyze_with_mask(
         self,
@@ -125,8 +132,6 @@ class ViolationAnalyzer:
         cadastral_parcels: List[CadastralParcel]
     ) -> List[Violation]:
         """Анализ с использованием векторных операций Shapely."""
-        from shapely.ops import unary_union
-        
         # Объединяем все кадастровые участки
         try:
             cadastral_union = unary_union([p.geometry for p in cadastral_parcels])
@@ -177,6 +182,60 @@ class ViolationAnalyzer:
                 continue
         
         return violations
+    
+    def _merge_violations_one_per_cadastral_parcel(
+        self, violations: List[Violation]
+    ) -> List[Violation]:
+        """
+        Один кадастровый участок — одно нарушение: геометрия = unary_union фрагментов,
+        площадь = площадь объединения (не сумма частей).
+        Без привязки к участку записи не объединяются.
+        """
+        bound = defaultdict(list)
+        unbound: List[Violation] = []
+        for v in violations:
+            if v.parcel is None:
+                unbound.append(v)
+                continue
+            bound[v.parcel.cadastral_number].append(v)
+        
+        out: List[Violation] = []
+        for _cn, vs in bound.items():
+            if len(vs) == 1:
+                out.append(vs[0])
+                continue
+            merged_geom = unary_union([v.geometry for v in vs])
+            if merged_geom.is_empty:
+                continue
+            if merged_geom.geom_type == 'GeometryCollection':
+                merged_geom = unary_union(
+                    [
+                        g
+                        for g in merged_geom.geoms
+                        if g.geom_type in ('Polygon', 'MultiPolygon') and not g.is_empty
+                    ]
+                )
+            if merged_geom.geom_type not in ('Polygon', 'MultiPolygon'):
+                continue
+            area = merged_geom.area
+            if area < self.config.min_violation_area:
+                continue
+            primary = max(vs, key=lambda x: x.violation_area)
+            sum_orig = sum(v.original_object_area for v in vs)
+            out.append(
+                Violation(
+                    geometry=merged_geom,
+                    violation_area=area,
+                    detected_object=primary.detected_object,
+                    parcel=primary.parcel,
+                    binding_type=primary.binding_type,
+                    binding_distance=min(v.binding_distance for v in vs),
+                    intersection_ratio=max(v.intersection_ratio for v in vs),
+                    original_object_area=sum_orig,
+                )
+            )
+        out.extend(unbound)
+        return out
     
     def _create_cadastral_mask(
         self,

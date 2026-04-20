@@ -75,18 +75,6 @@ def main():
         default=None,
         help='PROJ-строка для исходной системы координат векторов'
     )
-    parser.add_argument(
-        '--min-point-spacing',
-        type=float,
-        default=3.0,
-        help='Минимальное расстояние между точками нарушений (м) для упрощения'
-    )
-    parser.add_argument(
-        '--max-points',
-        type=int,
-        default=None,
-        help='Максимальное количество точек для отображения на одно нарушение'
-    )
     
     args = parser.parse_args()
     
@@ -101,8 +89,6 @@ def main():
             font_path=args.font,
             geotiff_path=args.geotiff,
             proj_string=args.proj_string,
-            min_point_spacing=args.min_point_spacing,
-            max_points=args.max_points
         )
         
         output_path = exporter.export(

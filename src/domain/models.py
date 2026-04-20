@@ -1,9 +1,9 @@
 """Доменные модели для представления данных."""
 
 from dataclasses import dataclass, field
-from typing import Tuple, Optional, Dict, Any, List
+from typing import Tuple, Optional, Dict, Any, List, Union
 import numpy as np
-from shapely.geometry import Polygon
+from shapely.geometry import Polygon, MultiPolygon
 from datetime import datetime
 
 
@@ -99,7 +99,7 @@ class CadastralParcel:
 class Violation:
     """Нарушение (обнаруженный объект вне кадастра)."""
     
-    geometry: Polygon
+    geometry: Union[Polygon, MultiPolygon]
     violation_area: float
     detected_object: DetectedObject
     parcel: Optional[CadastralParcel] = None

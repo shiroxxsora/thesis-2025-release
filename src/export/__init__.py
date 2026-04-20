@@ -9,7 +9,6 @@ from .coordinate_presenter import (
     present_xy,
     format_float,
     compute_distances,
-    simplify_points,
     safe_filename
 )
 
@@ -22,6 +21,5 @@ __all__ = [
     'present_xy',
     'format_float',
     'compute_distances',
-    'simplify_points',
     'safe_filename',
 ]

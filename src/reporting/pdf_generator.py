@@ -122,8 +122,8 @@ class PDFReportGenerator:
             ['Нарушений', str(len(violations))],
             ['Общая площадь объектов (м²)', f"{total_detected_area:.2f}"],
             ['Общая площадь кадастровых участков (м²)', f"{total_cadastral_area:.2f}"],
-            ['Общая площадь нарушений (м²)', f"{total_violation_area:.2f}"],
-            ['Площадь нарушений (га)', f"{total_violation_area/10000:.4f}"]
+            ['Общая площадь нарушений (м²), union по участку', f"{total_violation_area:.2f}"],
+            ['Площадь нарушений (га), union по участку', f"{total_violation_area/10000:.4f}"]
         ]
         
         stats_table = Table(stats_data)

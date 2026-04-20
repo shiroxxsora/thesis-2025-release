@@ -33,9 +33,50 @@ try:
 except ImportError:
     PYPROJ_AVAILABLE = False
 
-from .coordinate_presenter import simplify_points
-
 logger = logging.getLogger(__name__)
+
+
+def _proj4_tokens(proj4: str) -> dict:
+    return dict(p.split("=", 1) for p in proj4.strip().split() if "=" in p)
+
+
+def _normalize_map_dest_crs(dest_crs: "pyproj.CRS"):
+    """
+    WKT из GeoTIFF часто BOUNDCRS(проекция → WGS84). Для сопоставления с векторами
+    нужна именно проектируемая часть (как в GDAL SOURCECRS).
+    """
+    try:
+        if getattr(dest_crs, "is_bound", False):
+            return dest_crs.source_crs
+    except Exception:
+        pass
+    return dest_crs
+
+
+def _same_tmerc_false_easting_mismatch(src_crs: "pyproj.CRS", dest_crs: "pyproj.CRS") -> bool:
+    """
+    Та же эвристика, что в CoordinateTransformer._check_zone_offset:
+    один и тот же tmerc (lon_0, lat_0, …), но +x_0 в PROJ-строке отличается (часто 250000 в
+    ExportToProj4/WKT растра и 4250000 в строке для кадастра/Excel). Координаты пикселей
+    и WKT уже в одной метрической сетке геотрансформа — pyproj-переход даст сдвиг ~4 млн м.
+    """
+    try:
+        pa = _proj4_tokens(src_crs.to_proj4())
+        pb = _proj4_tokens(dest_crs.to_proj4())
+        if pa.get("+proj") != "tmerc" or pb.get("+proj") != "tmerc":
+            return False
+        for key in ("+lat_0", "+lon_0"):
+            if pa.get(key) != pb.get(key):
+                return False
+        xa = float(pa.get("+x_0", "0"))
+        xb = float(pb.get("+x_0", "0"))
+        if abs(xa - xb) < 1000.0:
+            return True
+        if abs(abs(xa - xb) - 4_000_000.0) < 500_000.0:
+            return True
+        return False
+    except Exception:
+        return False
 
 
 class MapGenerator:
@@ -56,8 +97,6 @@ class MapGenerator:
         viol_coords_df: pd.DataFrame,
         save_path: str,
         proj_string: Optional[str] = None,
-        min_point_spacing: float = 3.0,
-        max_points: Optional[int] = None
     ) -> None:
         """
         Создаёт zoom-карту с увеличением на нарушения конкретного участка.
@@ -69,8 +108,6 @@ class MapGenerator:
             viol_coords_df: DataFrame с координатами нарушений
             save_path: Путь для сохранения PNG
             proj_string: PROJ-строка исходной СК (опционально)
-            min_point_spacing: Минимальное расстояние между точками
-            max_points: Максимальное количество точек
         """
         v = violations_df[violations_df['Ближайший кадастровый номер'] == cadastral_number]
         if v.empty:
@@ -119,10 +156,10 @@ class MapGenerator:
         # Центроиды нарушений
         self._draw_centroids(ax, v, project)
 
-        # Нумерация точек
+        # Нумерация точек (координаты уже упрощены в Excel)
         self._draw_violation_points(
-            ax, cadastral_number, violations_df, viol_coords_df, 
-            project, min_point_spacing, max_points
+            ax, cadastral_number, violations_df, viol_coords_df,
+            project,
         )
 
         # Масштаб
@@ -142,8 +179,6 @@ class MapGenerator:
         viol_coords_df: pd.DataFrame,
         save_path: str,
         proj_string: Optional[str] = None,
-        min_point_spacing: float = 3.0,
-        max_points: Optional[int] = None
     ) -> None:
         """
         Создаёт обзорную карту участка с окружением.
@@ -155,8 +190,6 @@ class MapGenerator:
             viol_coords_df: DataFrame с координатами нарушений
             save_path: Путь для сохранения PNG
             proj_string: PROJ-строка исходной СК (опционально)
-            min_point_spacing: Минимальное расстояние между точками
-            max_points: Максимальное количество точек
         """
         v = violations_df[violations_df['Ближайший кадастровый номер'] == cadastral_number]
         
@@ -221,12 +254,13 @@ class MapGenerator:
         
         # Подпись участка
         cadastral_area = self._get_cadastral_area(cad_row)
+        # На участок одна строка нарушения (union); sum() на случай нескольких строк в старых отчётах
         total_violation_area = float(v['Площадь нарушения, м²'].fillna(0).sum()) if not v.empty else 0
         
         centroid = parcel_geom.centroid
         ax.text(
             centroid.x, centroid.y, 
-            f"КН: {cadastral_number}\nПлощадь: {cadastral_area:.2f} м²\nНарушений: {total_violation_area:.2f} м²",
+            f"КН: {cadastral_number}\nПлощадь участка: {cadastral_area:.2f} м²\nПлощадь нарушений: {total_violation_area:.2f} м²",
             fontsize=8, color='blue', ha='center', va='center',
             bbox=dict(boxstyle='round,pad=0.5', facecolor='white', edgecolor='blue', alpha=0.9)
         )
@@ -235,10 +269,10 @@ class MapGenerator:
         for g in geoms:
             self._plot_shapely(ax, g, facecolor='red', edgecolor='darkred', linewidth=1.0, alpha=0.5)
         
-        # Нумерация точек нарушений
+        # Нумерация точек нарушений (координаты уже упрощены в Excel)
         self._draw_violation_labels(
             ax, cadastral_number, violations_df, viol_coords_df,
-            project, min_point_spacing, max_points
+            project,
         )
         
         # Масштаб
@@ -278,10 +312,18 @@ class MapGenerator:
         
         try:
             _, _, dest_crs = self.background
-            if dest_crs:
-                src_crs = pyproj.CRS.from_proj4(proj_string)
-                transformer = pyproj.Transformer.from_crs(src_crs, dest_crs, always_xy=True)
-                return transformer.transform
+            if dest_crs is None:
+                return None
+            dest_crs = _normalize_map_dest_crs(dest_crs)
+            src_crs = pyproj.CRS.from_proj4(proj_string)
+            if _same_tmerc_false_easting_mismatch(src_crs, dest_crs):
+                logger.info(
+                    "Карты: tmerc с разным +x_0 у векторов и подложки (как 4250000 vs 250000 в "
+                    "метаданных) — координаты уже согласованы с geotransform, перепроецирование отключено."
+                )
+                return None
+            transformer = pyproj.Transformer.from_crs(src_crs, dest_crs, always_xy=True)
+            return transformer.transform
         except Exception as e:
             logger.warning(f"Не удалось создать трансформацию координат: {e}")
             return None
@@ -320,9 +362,9 @@ class MapGenerator:
     
     def _draw_violation_points(
         self, ax, cadastral_number: str, violations_df: pd.DataFrame,
-        viol_coords_df: pd.DataFrame, project, min_spacing: float, max_pts: Optional[int]
+        viol_coords_df: pd.DataFrame, project,
     ):
-        """Рисует нумерованные точки нарушений."""
+        """Рисует нумерованные точки нарушений по данным из отчёта (без доп. прореживания)."""
         vs_all = violations_df[violations_df['Ближайший кадастровый номер'] == cadastral_number]
         if vs_all.empty or viol_coords_df.empty or '№ нарушения' not in viol_coords_df.columns:
             return
@@ -355,10 +397,7 @@ class MapGenerator:
                 if len(pts) >= 2 and pts[0] == pts[-1]:
                     pts = pts[:-1]
                 
-                pts_simplified = simplify_points(pts, min_spacing=min_spacing, max_points=max_pts)
-                logger.debug(f"КН {cadastral_number}, Нарушение №{local_idx}: {len(pts)} -> {len(pts_simplified)} точек")
-                
-                for i, (x, y) in enumerate(pts_simplified, 1):
+                for i, (x, y) in enumerate(pts, 1):
                     ax.plot([x], [y], marker='o', markersize=2, color='darkred')
                     ax.text(
                         x, y, str(i), fontsize=5, color='darkred', ha='center', va='bottom',
@@ -369,7 +408,7 @@ class MapGenerator:
     
     def _draw_violation_labels(
         self, ax, cadastral_number: str, violations_df: pd.DataFrame,
-        viol_coords_df: pd.DataFrame, project, min_spacing: float, max_pts: Optional[int]
+        viol_coords_df: pd.DataFrame, project,
     ):
         """Рисует подписи нарушений на обзорной карте."""
         vs_all = violations_df[violations_df['Ближайший кадастровый номер'] == cadastral_number]
@@ -404,17 +443,15 @@ class MapGenerator:
                 if len(pts) >= 2 and pts[0] == pts[-1]:
                     pts = pts[:-1]
                 
-                pts_simplified = simplify_points(pts, min_spacing=min_spacing, max_points=max_pts)
-                
                 violation_area = row_v.get('Площадь нарушения, м²', 0)
                 try:
                     violation_area = float(pd.to_numeric(violation_area, errors='coerce'))
                 except Exception:
                     violation_area = 0
                 
-                if pts_simplified:
-                    centroid_x = sum(p[0] for p in pts_simplified) / len(pts_simplified)
-                    centroid_y = sum(p[1] for p in pts_simplified) / len(pts_simplified)
+                if pts:
+                    centroid_x = sum(p[0] for p in pts) / len(pts)
+                    centroid_y = sum(p[1] for p in pts) / len(pts)
                     ax.text(
                         centroid_x, centroid_y, 
                         f"№{local_idx}\n{violation_area:.1f} м²",
@@ -422,7 +459,7 @@ class MapGenerator:
                         bbox=dict(boxstyle='round,pad=0.3', facecolor='red', edgecolor='darkred', alpha=0.8)
                     )
                 
-                for i, (x, y) in enumerate(pts_simplified, 1):
+                for i, (x, y) in enumerate(pts, 1):
                     ax.plot([x], [y], marker='o', markersize=2.5, color='yellow', markeredgecolor='darkred', markeredgewidth=0.5)
                     ax.text(x, y, str(i), fontsize=5, color='black', ha='center', va='center', weight='bold')
         except Exception:

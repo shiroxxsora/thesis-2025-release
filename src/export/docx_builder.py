@@ -115,7 +115,9 @@ class DOCXBuilder:
         """Добавляет сводку по нарушениям."""
         sum_violation = float(violations_df['Площадь нарушения, м²'].fillna(0).sum())
         doc.add_paragraph(f"Количество нарушений: {len(violations_df)}")
-        doc.add_paragraph(f"Суммарная площадь нарушений: {sum_violation:.2f} м²")
+        doc.add_paragraph(
+            f"Площадь нарушений по участку (объединение контуров): {sum_violation:.2f} м²"
+        )
         
         # Краткая таблица нарушений
         v_table = doc.add_table(rows=1, cols=4)

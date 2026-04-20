@@ -3,7 +3,7 @@
 """
 
 import math
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 
 
 def present_xy(x: float, y: float) -> Tuple[float, float]:
@@ -72,46 +72,6 @@ def compute_distances(points_xy: List[Tuple[float, float]]) -> List[float]:
         distances.append(math.hypot(x2 - x1, y2 - y1))
     
     return distances
-
-
-def simplify_points(
-    points: List[Tuple[float, float]], 
-    min_spacing: float = 3.0, 
-    max_points: Optional[int] = None
-) -> List[Tuple[float, float]]:
-    """
-    Упрощает список точек для визуализации.
-    
-    Удаляет точки, которые расположены слишком близко друг к другу,
-    и опционально ограничивает общее количество точек.
-    
-    Args:
-        points: Исходный список точек
-        min_spacing: Минимальное расстояние между точками (м)
-        max_points: Максимальное количество точек (опционально)
-        
-    Returns:
-        Упрощённый список точек
-    """
-    if len(points) <= 3:
-        return points
-    
-    simplified = [points[0]]
-    
-    for i in range(1, len(points)):
-        x_prev, y_prev = simplified[-1]
-        x_curr, y_curr = points[i]
-        dist = math.hypot(x_curr - x_prev, y_curr - y_prev)
-        
-        if dist >= min_spacing:
-            simplified.append(points[i])
-    
-    if max_points and len(simplified) > max_points:
-        step = len(simplified) / max_points
-        indices = [int(i * step) for i in range(max_points)]
-        simplified = [simplified[i] for i in indices]
-    
-    return simplified
 
 
 def safe_filename(name: str) -> str:

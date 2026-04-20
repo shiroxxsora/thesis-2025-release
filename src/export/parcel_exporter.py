@@ -54,8 +54,6 @@ class ParcelExporter:
         font_path: Optional[str] = None,
         geotiff_path: Optional[str] = None,
         proj_string: Optional[str] = None,
-        min_point_spacing: float = 3.0,
-        max_points: Optional[int] = None
     ):
         """
         Args:
@@ -63,8 +61,6 @@ class ParcelExporter:
             font_path: Путь к TTF-шрифту с кириллицей (опционально)
             geotiff_path: Путь к GeoTIFF для подложки (опционально)
             proj_string: PROJ-строка для исходной СК векторов
-            min_point_spacing: Минимальное расстояние между точками (м)
-            max_points: Максимальное количество точек для отображения
         """
         self.output_dir = Path(output_dir)
         self.report_path = self.output_dir / "report.xlsx"
@@ -72,13 +68,14 @@ class ParcelExporter:
         
         self.font_path = font_path
         self.geotiff_path = geotiff_path or (self.output_dir.parent.parent / "geotiffs" / "input.tiff")
+        # +x_0=4250000 — та же МСК-03/Улан-Удэ, что и fallback в cadastral_reader: кадастр и отчёт
+        # в «зонной» записи. У GeoTIFF в WKT часто False easting 250000, но координаты уже
+        # согласованы с geotransform; MapGenerator не делает лишний pyproj-сдвиг между ними.
         self.proj_string = proj_string or (
             '+proj=tmerc +lat_0=0 +lon_0=109.03333333333 +k=1 +x_0=4250000 '
             '+y_0=-5211057.63 +ellps=krass +towgs84=23.57,-140.95,-79.8,0,0.35,0.79,-0.22 '
             '+units=m +no_defs'
         )
-        self.min_point_spacing = min_point_spacing
-        self.max_points = max_points
         
         # Компоненты
         self.pdf_builder = PDFBuilder(font_path=font_path)
@@ -291,7 +288,6 @@ class ParcelExporter:
             map_gen.create_zoom_map(
                 cad_number, cadastral_df, violations_df, viol_coords_df,
                 str(zoom_img_path), self.proj_string,
-                self.min_point_spacing, self.max_points
             )
             if zoom_img_path.exists():
                 return str(zoom_img_path)
@@ -311,7 +307,6 @@ class ParcelExporter:
             map_gen.create_overview_map(
                 cad_number, cadastral_df, violations_df, viol_coords_df,
                 str(overview_img_path), self.proj_string,
-                self.min_point_spacing, self.max_points
             )
             if overview_img_path.exists():
                 return str(overview_img_path)
