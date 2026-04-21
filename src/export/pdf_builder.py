@@ -14,7 +14,7 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
-from .coordinate_presenter import present_xy, format_float, compute_distances
+from .coordinate_presenter import format_float, compute_distances
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +65,7 @@ class PDFBuilder:
         violations_df: pd.DataFrame,
         viol_coords_df: pd.DataFrame,
         image_path: Optional[str] = None,
-        overview_path: Optional[str] = None
+        overview_path: Optional[str] = None,
     ) -> List:
         """
         Формирует содержимое PDF-документа для участка.
@@ -125,10 +125,14 @@ class PDFBuilder:
         return story
     
     def _add_violations_summary(
-        self, story: List, violations_df: pd.DataFrame,
-        normal: ParagraphStyle, heading: ParagraphStyle, viol_coords_df: pd.DataFrame
+        self,
+        story: List,
+        violations_df: pd.DataFrame,
+        normal: ParagraphStyle,
+        heading: ParagraphStyle,
+        viol_coords_df: pd.DataFrame,
     ):
-        """Добавляет сводку по нарушениям."""
+        """Добавляет сводку по нарушениям (координаты как в Excel — уже после present_xy)."""
         sum_violation = float(violations_df['Площадь нарушения, м²'].fillna(0).sum())
         story.append(Paragraph(f"Количество нарушений: <b>{len(violations_df)}</b>", normal))
         story.append(Paragraph(
@@ -152,11 +156,8 @@ class PDFBuilder:
                 cy = pd.to_numeric(r.get('Центроид Y', 0), errors='coerce')
             except Exception:
                 cy = 0
-            try:
-                cx_p, cy_p = present_xy(cx if pd.notna(cx) else 0, cy if pd.notna(cy) else 0)
-            except Exception:
-                cx_p, cy_p = cx, cy
-            
+            cx_p = float(cx) if pd.notna(cx) else 0.0
+            cy_p = float(cy) if pd.notna(cy) else 0.0
             v_table.append([
                 str(i),
                 format_float(area_val if pd.notna(area_val) else 0, 2),
@@ -180,10 +181,13 @@ class PDFBuilder:
             self._add_violation_coords_tables(story, violations_df, viol_coords_df, heading)
     
     def _add_violation_coords_tables(
-        self, story: List, violations_df: pd.DataFrame,
-        viol_coords_df: pd.DataFrame, heading: ParagraphStyle
+        self,
+        story: List,
+        violations_df: pd.DataFrame,
+        viol_coords_df: pd.DataFrame,
+        heading: ParagraphStyle,
     ):
-        """Добавляет таблицы координат для каждого нарушения."""
+        """Добавляет таблицы координат (как в Excel, без повторного present_xy)."""
         v_reset = violations_df.reset_index(drop=True)
         for local_idx, (idx_row, row_v) in enumerate(v_reset.iterrows(), 1):
             global_v_num = row_v.get('№ нарушения', idx_row + 1)
@@ -212,7 +216,7 @@ class PDFBuilder:
                 vt = [['Обозначение\nточки', 'X', 'Y', 'Расстояние до точки, м.']]
                 for i, (x, y) in enumerate(pts, 1):
                     dist_idx = (i - 2) % len(dists)
-                    px, py = present_xy(x, y)
+                    px, py = float(x), float(y)
                     vt.append([
                         str(i),
                         format_float(px, 2),
@@ -255,7 +259,7 @@ class PDFBuilder:
         violations_df: pd.DataFrame,
         viol_coords_df: pd.DataFrame,
         image_path: Optional[str] = None,
-        overview_path: Optional[str] = None
+        overview_path: Optional[str] = None,
     ) -> str:
         """
         Генерирует PDF-документ для участка.
@@ -274,8 +278,13 @@ class PDFBuilder:
             Путь к созданному PDF-файлу
         """
         story = self.build_story(
-            cadastral_number, cadastral_df, coords_df,
-            violations_df, viol_coords_df, image_path, overview_path
+            cadastral_number,
+            cadastral_df,
+            coords_df,
+            violations_df,
+            viol_coords_df,
+            image_path,
+            overview_path,
         )
         
         doc = SimpleDocTemplate(

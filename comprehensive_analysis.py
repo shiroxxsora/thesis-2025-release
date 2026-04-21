@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 # Импорты из отрефакторенного кода
 from src.main import ComprehensiveAnalyzer as RefactoredAnalyzer
 from src.config.settings import AnalysisConfig
+from src.config.constants import DEFAULT_MAP_FIGURE_DPI, DEFAULT_MAP_FIGURE_SIZE
 from src.utils.logging_config import setup_logging
 import logging
 
@@ -85,7 +86,11 @@ class ComprehensiveAnalyzer:
         new_config.binding_min_intersection_ratio = self.config['binding_min_intersection_ratio']
         new_config.binding_boundary_buffer_m = self.config['binding_boundary_buffer_m']
         new_config.binding_max_nearest_distance_m = self.config['binding_max_nearest_distance_m']
-        
+
+        new_config.map_figure_size = DEFAULT_MAP_FIGURE_SIZE
+        new_config.map_figure_dpi = DEFAULT_MAP_FIGURE_DPI
+        # map_max_raster_edge — из AnalysisConfig (по умолчанию ~8192 px; None = полный растр, риск OOM)
+
         self._analyzer = RefactoredAnalyzer(new_config)
         
         print("="*80)

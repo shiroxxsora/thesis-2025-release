@@ -247,7 +247,7 @@ class ParcelExporter:
             if out_format in ('pdf', 'both'):
                 self.pdf_builder.generate(
                     str(pdf_path), cad_number, cadastral_df, coords_df,
-                    violations_df, viol_coords_df, zoom_img_path, overview_img_path
+                    violations_df, viol_coords_df, zoom_img_path, overview_img_path,
                 )
             
             if out_format in ('docx', 'both'):
@@ -260,7 +260,7 @@ class ParcelExporter:
                     docx_builder = DOCXBuilder()
                     docx_builder.generate(
                         str(docx_path), cad_number, cadastral_df, coords_df,
-                        violations_df, viol_coords_df, zoom_img_path, overview_img_path
+                        violations_df, viol_coords_df, zoom_img_path, overview_img_path,
                     )
                 except RuntimeError as e:
                     # Пробрасываем RuntimeError дальше, чтобы он был пойман общим except

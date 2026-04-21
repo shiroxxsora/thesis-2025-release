@@ -2,8 +2,7 @@
 
 import logging
 from typing import List, Optional, Tuple
-from shapely.geometry import Polygon
-from shapely.strtree import STRtree
+from shapely.geometry import Point, Polygon
 
 from ..domain.models import CadastralParcel, DetectedObject
 
@@ -105,38 +104,64 @@ class CadastralMatcher:
         violation_geometry: Polygon,
         cadastral_parcels: List[CadastralParcel]
     ) -> Tuple[Optional[CadastralParcel], float]:
-        """Привязка по касанию границы."""
+        """Привязка по касанию границы: ближайший по расстоянию, при ничьей — по центроиду."""
+        rp = violation_geometry.representative_point()
+        candidates: List[Tuple[float, float, CadastralParcel]] = []
         for parcel in cadastral_parcels:
             try:
                 distance = violation_geometry.distance(parcel.geometry)
-                
                 if distance <= self.boundary_buffer_m:
-                    return parcel, distance
+                    tie = rp.distance(Point(parcel.centroid))
+                    candidates.append((distance, tie, parcel))
             except Exception:
                 continue
-        
-        return None, 0.0
+        if not candidates:
+            return None, 0.0
+        candidates.sort(key=lambda x: (x[0], x[1]))
+        return candidates[0][2], candidates[0][0]
     
     def _match_by_nearest(
         self,
         violation_geometry: Polygon,
         cadastral_parcels: List[CadastralParcel]
     ) -> Tuple[Optional[CadastralParcel], float]:
-        """Привязка к ближайшему участку."""
-        nearest_parcel = None
-        min_distance = float('inf')
-        
+        """Привязка к ближайшему участку в пределах max_dist; при равных d — по близости центроидов."""
+        rp = violation_geometry.representative_point()
+        candidates: List[Tuple[float, float, CadastralParcel]] = []
         for parcel in cadastral_parcels:
             try:
                 distance = violation_geometry.distance(parcel.geometry)
-                
-                if distance < min_distance:
-                    min_distance = distance
-                    nearest_parcel = parcel
+                if distance <= self.max_nearest_distance_m:
+                    tie = rp.distance(Point(parcel.centroid))
+                    candidates.append((distance, tie, parcel))
             except Exception:
                 continue
-        
-        if nearest_parcel and min_distance <= self.max_nearest_distance_m:
-            return nearest_parcel, min_distance
-        
-        return None, 0.0
+        if not candidates:
+            return None, 0.0
+        candidates.sort(key=lambda x: (x[0], x[1]))
+        return candidates[0][2], candidates[0][0]
+
+    def match_nearest_unlimited(
+        self,
+        violation_geometry: Polygon,
+        cadastral_parcels: List[CadastralParcel],
+    ) -> Tuple[Optional[CadastralParcel], float]:
+        """
+        Ближайший ЗУ по расстоянию до полигона без порога max_nearest_distance_m
+        (fallback, если match() вернул None).
+        """
+        if not cadastral_parcels:
+            return None, 0.0
+        rp = violation_geometry.representative_point()
+        candidates: List[Tuple[float, float, CadastralParcel]] = []
+        for parcel in cadastral_parcels:
+            try:
+                distance = violation_geometry.distance(parcel.geometry)
+                tie = rp.distance(Point(parcel.centroid))
+                candidates.append((distance, tie, parcel))
+            except Exception:
+                continue
+        if not candidates:
+            return None, 0.0
+        candidates.sort(key=lambda x: (x[0], x[1]))
+        return candidates[0][2], candidates[0][0]

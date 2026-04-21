@@ -26,6 +26,13 @@ DEFAULT_CV_EPS_FACTOR = 0.004
 DEFAULT_DPI = 200
 DEFAULT_FIGURE_SIZE = (12, 8)
 
+# Обзорная карта visualization.png: пиксели ≈ map_figure_size[in] × map_figure_dpi (минус поля от tight_layout).
+DEFAULT_MAP_FIGURE_SIZE = (22.0, 14.67)
+DEFAULT_MAP_FIGURE_DPI = 350
+
+# Подложка overview: длина длинной стороны растра в px (прореживание). None = без лимита (риск OOM на больших GeoTIFF).
+DEFAULT_MAP_MAX_RASTER_EDGE = 8192
+
 # Форматы экспорта
 SUPPORTED_IMAGE_FORMATS = ['.tif', '.tiff', '.jpg', '.jpeg', '.png']
 SUPPORTED_VECTOR_FORMATS = ['.shp', '.geojson', '.gpkg']

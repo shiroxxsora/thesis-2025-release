@@ -7,9 +7,11 @@ from .docx_builder import DOCXBuilder
 from .map_generator import MapGenerator
 from .coordinate_presenter import (
     present_xy,
+    present_xy_extrema_from_bounds,
+    parse_false_easting_x0_from_proj4,
     format_float,
     compute_distances,
-    safe_filename
+    safe_filename,
 )
 
 __all__ = [
@@ -19,6 +21,8 @@ __all__ = [
     'DOCXBuilder',
     'MapGenerator',
     'present_xy',
+    'present_xy_extrema_from_bounds',
+    'parse_false_easting_x0_from_proj4',
     'format_float',
     'compute_distances',
     'safe_filename',

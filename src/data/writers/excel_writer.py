@@ -2,12 +2,13 @@
 
 import logging
 import pandas as pd
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 from pathlib import Path
 from datetime import datetime
 
 from .base import DataWriter
 from ...domain.models import DetectedObject, CadastralParcel, Violation
+from ...export.coordinate_presenter import present_xy, present_xy_extrema_from_bounds
 
 logger = logging.getLogger(__name__)
 
@@ -22,23 +23,6 @@ def _violation_coord_rows(geom):
             pts.extend(list(p.exterior.coords))
         return pts
     return []
-
-
-def _present_xy(x: float, y: float) -> Tuple[float, float]:
-    """
-    Преобразует координаты для отображения.
-    Меняет X и Y местами и добавляет смещение.
-    """
-    try:
-        xf = float(x)
-        yf = float(y)
-    except Exception:
-        return x, y
-    
-    new_x = yf
-    sign = -1.0 if xf < 0 else 1.0
-    new_y = sign * (4000000.0 + abs(xf))
-    return new_x, new_y
 
 
 class ExcelWriter(DataWriter):
@@ -58,59 +42,66 @@ class ExcelWriter(DataWriter):
         cadastral_parcels: List[CadastralParcel],
         violations: List[Violation],
         path: str,
+        proj_false_easting_x0: Optional[float] = None,
     ) -> None:
         """
         Записывает отчёт в Excel.
 
         Ожидается, что ``cadastral_parcels`` и ``violations`` уже приведены к виду
         для карт и per_parcel (упрощённые контуры тем же tolerance, что в пайплайне).
+
+        proj_false_easting_x0: +x_0 из PROJ растра; для МСК с x_0≠4250000 подправляет
+        север для колонок в «зонной» записи документов.
         """
         logger.info(f"Создание Excel отчёта: {path}")
-        
-        with pd.ExcelWriter(path, engine='openpyxl') as writer:
-            # 1. Сводка
-            self._write_summary(writer, detected_objects, cadastral_parcels, violations)
+        self._proj_x0 = proj_false_easting_x0
+        try:
+            with pd.ExcelWriter(path, engine='openpyxl') as writer:
+                # 1. Сводка
+                self._write_summary(writer, detected_objects, cadastral_parcels, violations)
+                
+                # 2. Кадастровые участки
+                self._write_cadastral(writer, cadastral_parcels)
+                
+                # 3. Нарушения
+                self._write_violations(writer, violations)
+                
+                # 4. Координаты участков
+                self._write_parcel_coords(writer, cadastral_parcels)
+                
+                # 5. Координаты нарушений
+                self._write_violation_coords(writer, violations)
+                
+                # Форматирование столбцов (автоширина)
+                for sheet_name in writer.sheets:
+                    worksheet = writer.sheets[sheet_name]
+                    for column in worksheet.columns:
+                        max_length = 0
+                        column_letter = column[0].column_letter
+                        for cell in column:
+                            try:
+                                if len(str(cell.value)) > max_length:
+                                    max_length = len(str(cell.value))
+                            except Exception:
+                                pass
+                        adjusted_width = min(max_length + 2, 50)
+                        worksheet.column_dimensions[column_letter].width = adjusted_width
             
-            # 2. Кадастровые участки
-            self._write_cadastral(writer, cadastral_parcels)
+            # Статистика
+            total_cadastral_area = sum(obj.area_sqm for obj in cadastral_parcels)
+            total_violation_area = sum(v.violation_area for v in violations)
             
-            # 3. Нарушения
-            self._write_violations(writer, violations)
-            
-            # 4. Координаты участков
-            self._write_parcel_coords(writer, cadastral_parcels)
-            
-            # 5. Координаты нарушений
-            self._write_violation_coords(writer, violations)
-            
-            # Форматирование столбцов (автоширина)
-            for sheet_name in writer.sheets:
-                worksheet = writer.sheets[sheet_name]
-                for column in worksheet.columns:
-                    max_length = 0
-                    column_letter = column[0].column_letter
-                    for cell in column:
-                        try:
-                            if len(str(cell.value)) > max_length:
-                                max_length = len(str(cell.value))
-                        except Exception:
-                            pass
-                    adjusted_width = min(max_length + 2, 50)
-                    worksheet.column_dimensions[column_letter].width = adjusted_width
-        
-        # Статистика
-        total_cadastral_area = sum(obj.area_sqm for obj in cadastral_parcels)
-        total_violation_area = sum(v.violation_area for v in violations)
-        
-        logger.info(f"Excel отчёт создан: {path}")
-        logger.info(f"Отчёт содержит {len(cadastral_parcels)} кадастровых участков и {len(violations)} нарушений")
-        logger.info(f"Общая площадь кадастровых участков: {total_cadastral_area:.2f} м² ({total_cadastral_area/10000:.4f} га)")
-        logger.info(
-            f"Общая площадь нарушений (union по участку): {total_violation_area:.2f} м² "
-            f"({total_violation_area/10000:.4f} га)"
-        )
-        if total_cadastral_area > 0:
-            logger.info(f"Процент нарушений: {(total_violation_area/total_cadastral_area*100):.2f}%")
+            logger.info(f"Excel отчёт создан: {path}")
+            logger.info(f"Отчёт содержит {len(cadastral_parcels)} кадастровых участков и {len(violations)} нарушений")
+            logger.info(f"Общая площадь кадастровых участков: {total_cadastral_area:.2f} м² ({total_cadastral_area/10000:.4f} га)")
+            logger.info(
+                f"Общая площадь нарушений (union по участку): {total_violation_area:.2f} м² "
+                f"({total_violation_area/10000:.4f} га)"
+            )
+            if total_cadastral_area > 0:
+                logger.info(f"Процент нарушений: {(total_violation_area/total_cadastral_area*100):.2f}%")
+        finally:
+            self._proj_x0 = None
     
     def _write_summary(self, writer, detected, cadastral, violations):
         """Записывает сводку."""
@@ -142,29 +133,31 @@ class ExcelWriter(DataWriter):
         for i, p in enumerate(cadastral_parcels, 1):
             g = p.geometry
             cxy = g.centroid.coords[0]
+            ccx, ccy = present_xy(cxy[0], cxy[1], self._proj_x0)
             row = {
                 '№ п/п': i,
                 'Кадастровый номер': p.cadastral_number,
                 'Площадь, м²': round(p.area_sqm, 2),
                 'Площадь, га': round(p.area_sqm / 10000, 6),
-                'Центроид X': round(_present_xy(cxy[0], cxy[1])[0], 6),
-                'Центроид Y': round(_present_xy(cxy[0], cxy[1])[1], 6),
+                'Центроид X': round(ccx, 6),
+                'Центроид Y': round(ccy, 6),
                 'Периметр, м': round(g.length, 2)
             }
             
-            # Bounds
+            # Bounds: экстремумы по четырём углам bbox после present_xy
             bounds = g.bounds
+            mix, miy, mxx, mxy = present_xy_extrema_from_bounds(bounds, self._proj_x0)
             row.update({
-                'Мин X': round(bounds[0], 6),
-                'Мин Y': round(bounds[1], 6),
-                'Макс X': round(bounds[2], 6),
-                'Макс Y': round(bounds[3], 6)
+                'Мин X': round(mix, 6),
+                'Мин Y': round(miy, 6),
+                'Макс X': round(mxx, 6),
+                'Макс Y': round(mxy, 6),
             })
             
             # Первые 10 точек контура
             coords = list(g.exterior.coords)[:10]
             for j, (x, y) in enumerate(coords, 1):
-                px, py = _present_xy(x, y)
+                px, py = present_xy(x, y, self._proj_x0)
                 row[f'Точка {j} X'] = round(px, 6)
                 row[f'Точка {j} Y'] = round(py, 6)
             
@@ -185,31 +178,32 @@ class ExcelWriter(DataWriter):
         for i, v in enumerate(violations, 1):
             g = v.geometry
             cxy = v.centroid if v.centroid is not None else g.centroid.coords[0]
+            vcx, vcy = present_xy(cxy[0], cxy[1], self._proj_x0)
             row = {
                 '№ нарушения': i,
                 'Площадь нарушения, м²': round(v.violation_area, 2),
                 'Площадь нарушения, га': round(v.violation_area / 10000, 6),
                 'Площадь исходного объекта, м²': round(v.original_object_area, 2),
-                'Центроид X': round(_present_xy(cxy[0], cxy[1])[0], 6),
-                'Центроид Y': round(_present_xy(cxy[0], cxy[1])[1], 6),
+                'Центроид X': round(vcx, 6),
+                'Центроид Y': round(vcy, 6),
                 'Ближайший кадастровый номер': v.cadastral_number,
                 'Периметр нарушения, м': round(g.length, 2)
             }
             
-            # Bounds с преобразованием координат
             bounds = g.bounds
+            mix, miy, mxx, mxy = present_xy_extrema_from_bounds(bounds, self._proj_x0)
             row.update({
-                'Мин X': round(_present_xy(bounds[0], bounds[1])[0], 6),
-                'Мин Y': round(_present_xy(bounds[0], bounds[1])[1], 6),
-                'Макс X': round(_present_xy(bounds[2], bounds[3])[0], 6),
-                'Макс Y': round(_present_xy(bounds[2], bounds[3])[1], 6)
+                'Мин X': round(mix, 6),
+                'Мин Y': round(miy, 6),
+                'Макс X': round(mxx, 6),
+                'Макс Y': round(mxy, 6),
             })
             
             # Координаты контура (первые 10 точек)
             try:
                 coords = _violation_coord_rows(g)[:10]
                 for j, (x, y) in enumerate(coords, 1):
-                    px, py = _present_xy(x, y)
+                    px, py = present_xy(x, y, self._proj_x0)
                     row[f'Точка {j} X'] = round(px, 6)
                     row[f'Точка {j} Y'] = round(py, 6)
             except Exception:
@@ -232,7 +226,7 @@ class ExcelWriter(DataWriter):
         for p in cadastral_parcels:
             coords = list(p.geometry.exterior.coords)
             for i, (x, y) in enumerate(coords, 1):
-                px, py = _present_xy(x, y)
+                px, py = present_xy(x, y, self._proj_x0)
                 data.append({
                     'Кадастровый номер': p.cadastral_number,
                     'Номер точки': i,
@@ -253,7 +247,7 @@ class ExcelWriter(DataWriter):
             try:
                 coords = _violation_coord_rows(v.geometry)
                 for j, (x, y) in enumerate(coords, 1):
-                    px, py = _present_xy(x, y)
+                    px, py = present_xy(x, y, self._proj_x0)
                     data.append({
                         '№ нарушения': i,
                         'Номер точки': j,

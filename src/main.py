@@ -18,6 +18,7 @@ from .utils.document_geometry import (
     cadastral_parcels_for_maps_and_documents,
     violations_for_maps_and_documents,
 )
+from .export.coordinate_presenter import parse_false_easting_x0_from_proj4
 
 
 class ComprehensiveAnalyzer:
@@ -66,7 +67,12 @@ class ComprehensiveAnalyzer:
         self.json_writer = JSONWriter()
         
         # Visualization
-        self.visualizer = MapVisualizer(self.config.output_dir)
+        self.visualizer = MapVisualizer(
+            self.config.output_dir,
+            dpi=self.config.map_figure_dpi,
+            max_raster_edge=self.config.map_max_raster_edge,
+            figure_size=self.config.map_figure_size,
+        )
         
         # Reporting
         self.pdf_generator = PDFReportGenerator(self.config.output_dir)
@@ -201,11 +207,15 @@ class ComprehensiveAnalyzer:
         )
         
         # Excel: те же упрощённые контуры, что на глобальной карте и в per_parcel
+        doc_x0 = parse_false_easting_x0_from_proj4(
+            geotiff_data.proj4_projection or ""
+        )
         self.excel_writer.write(
             detected_objects,
             cadastral_docs,
             violations_docs,
             str(output_dir / 'report.xlsx'),
+            proj_false_easting_x0=doc_x0,
         )
         
         # JSON

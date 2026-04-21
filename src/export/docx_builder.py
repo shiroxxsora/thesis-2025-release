@@ -17,7 +17,7 @@ try:
 except Exception:
     DOCX_AVAILABLE = False
 
-from .coordinate_presenter import present_xy, compute_distances
+from .coordinate_presenter import compute_distances
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +41,7 @@ class DOCXBuilder:
         violations_df: pd.DataFrame,
         viol_coords_df: pd.DataFrame,
         image_path: Optional[str] = None,
-        overview_path: Optional[str] = None
+        overview_path: Optional[str] = None,
     ) -> str:
         """
         Генерирует DOCX-документ для участка.
@@ -110,9 +110,12 @@ class DOCXBuilder:
                 pass
     
     def _add_violations_summary(
-        self, doc, violations_df: pd.DataFrame, viol_coords_df: pd.DataFrame
+        self,
+        doc,
+        violations_df: pd.DataFrame,
+        viol_coords_df: pd.DataFrame,
     ):
-        """Добавляет сводку по нарушениям."""
+        """Добавляет сводку по нарушениям (координаты как в Excel)."""
         sum_violation = float(violations_df['Площадь нарушения, м²'].fillna(0).sum())
         doc.add_paragraph(f"Количество нарушений: {len(violations_df)}")
         doc.add_paragraph(
@@ -146,22 +149,23 @@ class DOCXBuilder:
             except Exception:
                 cy = 0
             
-            px, py = present_xy(cx, cy)
-            
             row = v_table.add_row().cells
             row[0].text = str(i)
             row[1].text = f"{area_val:.2f}"
-            row[2].text = f"{px:.2f}"
-            row[3].text = f"{py:.2f}"
+            row[2].text = f"{cx:.2f}"
+            row[3].text = f"{cy:.2f}"
         
         # Таблицы координат по каждому нарушению
         if not viol_coords_df.empty and '№ нарушения' in viol_coords_df.columns:
             self._add_violation_coords_tables(doc, violations_df, viol_coords_df)
     
     def _add_violation_coords_tables(
-        self, doc, violations_df: pd.DataFrame, viol_coords_df: pd.DataFrame
+        self,
+        doc,
+        violations_df: pd.DataFrame,
+        viol_coords_df: pd.DataFrame,
     ):
-        """Добавляет таблицы координат для каждого нарушения."""
+        """Добавляет таблицы координат (как в Excel)."""
         v_reset = violations_df.reset_index(drop=True)
         for local_idx, (idx_row, row_v) in enumerate(v_reset.iterrows(), 1):
             global_v_num = row_v.get('№ нарушения', idx_row + 1)
@@ -200,7 +204,7 @@ class DOCXBuilder:
             
             for j, (x, y) in enumerate(pts, 1):
                 dist_idx = (j - 2) % len(dists)
-                px, py = present_xy(x, y)
+                px, py = float(x), float(y)
                 rw = vt.add_row().cells
                 rw[0].text = str(j)
                 rw[1].text = f"{px:.2f}"

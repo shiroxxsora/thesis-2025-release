@@ -3,13 +3,23 @@
 import math
 import logging
 from typing import List, Tuple, Iterator
+
+import cv2
 import numpy as np
+import torch
 
 from ..domain.models import GeoTiffData, DetectedObject
 from ..processing.image_processor import ImageProcessor
 from ..detection.mask_processor import MaskProcessor
 
 logger = logging.getLogger(__name__)
+
+
+def _release_cuda_after_chunk() -> None:
+    """Снижает фрагментацию VRAM: outputs Detectron2 держит большие тензоры до del/GC."""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
 
 class ChunkProcessor:
@@ -122,29 +132,46 @@ class ChunkProcessor:
                 chunk,
                 model_input_size
             )
-            
-            # Получаем маски от детектора
-            import torch
-            with torch.no_grad():
-                outputs = predictor(prepared_chunk)
-            
-            instances = outputs["instances"].to("cpu")
-            
+            outputs = None
+            try:
+                with torch.no_grad():
+                    outputs = predictor(prepared_chunk)
+                instances = outputs["instances"].to("cpu")
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    logger.error(
+                        "CUDA OOM на чанке %s/%s (%s). Уменьшите chunk_size/overlap в конфиге "
+                        "или освободите VRAM.",
+                        processed,
+                        total_chunks,
+                        chunk_id,
+                    )
+                    _release_cuda_after_chunk()
+                raise
+            finally:
+                del prepared_chunk
+                if outputs is not None:
+                    del outputs
+
             if not instances.has("pred_masks"):
+                del instances
+                _release_cuda_after_chunk()
                 continue
-            
+
             masks = instances.pred_masks.cpu().numpy()
-            
+            del instances
+
             if len(masks) == 0:
+                del masks
+                _release_cuda_after_chunk()
                 continue
-            
+
             # Масштабируем маски к размеру чанка
             chunk_height = chunk.shape[1] if chunk.ndim == 3 and chunk.shape[0] <= 4 else chunk.shape[0]
             chunk_width = chunk.shape[2] if chunk.ndim == 3 and chunk.shape[0] <= 4 else chunk.shape[1]
             
             # Обрабатываем каждую маску
             for mask_idx, mask in enumerate(masks):
-                import cv2
                 mask_resized = cv2.resize(
                     mask.astype(np.uint8),
                     (chunk_width, chunk_height),
@@ -161,6 +188,9 @@ class ChunkProcessor:
                 )
                 
                 all_objects.extend(objects)
+
+            del masks
+            _release_cuda_after_chunk()
         
         logger.info(f"Обнаружено {len(all_objects)} объектов во всех чанках")
         return all_objects

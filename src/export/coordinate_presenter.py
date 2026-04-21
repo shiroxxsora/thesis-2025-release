@@ -3,34 +3,105 @@
 """
 
 import math
-from typing import List, Tuple
+import re
+from typing import List, Optional, Tuple
+
+# Типовое ложное востокание для «зонной» записи МСК в кадастровых документах (м)
+MSK_FALSE_EASTING_CANONICAL = 4_250_000.0
+# Сдвиг сетки между вариантами метаданных (+x_0=250000 vs ожидаемая зонная запись)
+MSK_GRID_OFFSET_M = 4_000_000.0
+# Нординг ниже порога не трогаем (уже в виде ~4.1e6); выше — вероятен лишний +4e6 (напр. 8.1e6)
+_NORTHING_ADJUST_MIN = 6_500_000.0
 
 
-def present_xy(x: float, y: float) -> Tuple[float, float]:
+def parse_false_easting_x0_from_proj4(proj4: str) -> Optional[float]:
+    """Извлекает +x_0 из PROJ4-строки."""
+    if not proj4 or not isinstance(proj4, str):
+        return None
+    for token in proj4.strip().split():
+        if token.startswith("+x_0="):
+            try:
+                return float(token.split("=", 1)[1])
+            except ValueError:
+                return None
+    # Иногда без пробелов
+    m = re.search(r"\+x_0=([+-]?\d+\.?\d*)", proj4)
+    if m:
+        try:
+            return float(m.group(1))
+        except ValueError:
+            return None
+    return None
+
+
+def adjust_xy_before_document_present(
+    x: float, y: float, proj_false_easting_x0: Optional[float]
+) -> Tuple[float, float]:
     """
-    Трансформирует координаты для представления в документах.
-    
-    Применяет специальную трансформацию:
-    - Меняет местами X и Y
-    - Применяет смещение по Y
-    
-    Args:
-        x: Исходная координата X
-        y: Исходная координата Y
-        
-    Returns:
-        Кортеж (new_x, new_y) трансформированных координат
+    При +x_0 в метаданных не как в типовой зонной записи (4250000), а например 250000,
+    нординг в метрах иногда приходит с лишними 4e6 (8148012 вместо 4148012). Перед
+    present_xy приводим Y к виду, согласованному с ожидаемой «зонной» записью МСК.
     """
     try:
         xf = float(x)
         yf = float(y)
+    except (TypeError, ValueError):
+        return (x, y)
+    if proj_false_easting_x0 is None:
+        return xf, yf
+    try:
+        x0 = float(proj_false_easting_x0)
+    except (TypeError, ValueError):
+        return xf, yf
+    if abs(x0 - MSK_FALSE_EASTING_CANONICAL) < 200_000.0:
+        return xf, yf
+    if yf >= _NORTHING_ADJUST_MIN:
+        yf -= MSK_GRID_OFFSET_M
+    return xf, yf
+
+
+def present_xy(
+    x: float,
+    y: float,
+    proj_false_easting_x0: Optional[float] = None,
+) -> Tuple[float, float]:
+    """
+    Трансформирует координаты для представления в документах.
+
+    Сначала при необходимости сдвигает север (см. adjust_xy_before_document_present),
+    затем: меняет местами X и Y, применяет смещение по второй координате (историческая схема).
+
+    Args:
+        x: Исходная координата X (восток, м)
+        y: Исходная координата Y (север, м)
+        proj_false_easting_x0: +x_0 из PROJ растра/сцены; None — без сдвига по сетке МСК.
+    """
+    xf, yf = adjust_xy_before_document_present(x, y, proj_false_easting_x0)
+    try:
+        xf = float(xf)
+        yf = float(yf)
     except Exception:
         return x, y
-    
+
     new_x = yf
     sign = -1.0 if xf < 0 else 1.0
     new_y = sign * (4000000.0 + abs(xf))
     return new_x, new_y
+
+
+def present_xy_extrema_from_bounds(
+    bounds: Tuple[float, float, float, float],
+    proj_false_easting_x0: Optional[float],
+) -> Tuple[float, float, float, float]:
+    """
+    Мин/макс в «документных» осях после present_xy по четырём углам осевого bbox.
+    """
+    minx, miny, maxx, maxy = bounds
+    corners = ((minx, miny), (minx, maxy), (maxx, miny), (maxx, maxy))
+    pxys = [present_xy(a, b, proj_false_easting_x0) for a, b in corners]
+    xs = [p[0] for p in pxys]
+    ys = [p[1] for p in pxys]
+    return (min(xs), min(ys), max(xs), max(ys))
 
 
 def format_float(value: float, ndigits: int = 2) -> str:

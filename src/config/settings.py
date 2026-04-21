@@ -1,7 +1,7 @@
 """Настройки и конфигурация приложения."""
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Tuple
 from pathlib import Path
 
 from .constants import *
@@ -52,7 +52,16 @@ class AnalysisConfig:
     
     # Дедупликация
     overlap_threshold: float = DEFAULT_OVERLAP_THRESHOLD
-    
+
+    # Карта overview: макс. длина стороны подложки в пикселях (снижает память).
+    # None — без прореживания (только при достаточной RAM; иначе процесс могут убить).
+    map_max_raster_edge: Optional[int] = DEFAULT_MAP_MAX_RASTER_EDGE
+
+    # Итоговый PNG: matplotlib растеризует фигуру в (размер в дюймах × DPI), не в размер растра.
+    # Увеличьте эти значения, если картинка выглядит «мыльной» при зуме.
+    map_figure_size: Tuple[float, float] = DEFAULT_MAP_FIGURE_SIZE
+    map_figure_dpi: int = DEFAULT_MAP_FIGURE_DPI
+
     def __post_init__(self):
         """Создаёт выходную директорию если её нет."""
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
