@@ -12,6 +12,7 @@ from shapely.ops import split, unary_union
 from ..domain.models import DetectedObject, CadastralParcel, Violation, GeoTiffData
 from ..analysis.cadastral_matcher import CadastralMatcher
 from ..config.settings import AnalysisConfig
+from ..processing.geometry_processor import GeometryProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -71,9 +72,8 @@ class ViolationAnalyzer:
             geotiff_data: Данные GeoTIFF (для mask-based анализа)
             
         Returns:
-            Список нарушений. Если ``merge_violations_per_parcel`` — по одному на кадастровый
-            номер с unary_union фрагментов; иначе отдельная запись на каждый полигональный
-            фрагмент (в т.ч. части MultiPolygon после difference).
+            Список нарушений (без объединения «один на ЗУ»): каждый объект даёт максимум
+            один полигон нарушения, который затем привязывается к кадастровому участку.
         """
         logger.info("Начинаю анализ нарушений...")
         
@@ -86,23 +86,22 @@ class ViolationAnalyzer:
             # Все объекты считаем нарушениями без привязки
             return self._create_unmatched_violations(detected_objects)
         
-        # Используем векторный метод (более надёжный)
-        violations = self._analyze_vector(
-            detected_objects,
-            cadastral_parcels
-        )
-        if self.config.merge_violations_per_parcel:
+        # При наличии GeoTIFF используем маски: вычитаем кадастр в пикселях, затем split/bind.
+        if geotiff_data is not None:
+            violations = self._analyze_with_mask(detected_objects, cadastral_parcels, geotiff_data)
+        else:
+            violations = self._analyze_vector(detected_objects, cadastral_parcels)
+
+        if getattr(self.config, "merge_violations_per_parcel", False):
             merged = self._merge_violations_one_per_cadastral_parcel(violations)
             logger.info(
-                "Нарушений после union по кадастру: %s (фрагментов до объединения: %s)",
+                "Нарушений после union по участку: %s (до объединения: %s)",
                 len(merged),
                 len(violations),
             )
             return merged
-        logger.info(
-            "Нарушений (без union по участку): %s записей",
-            len(violations),
-        )
+
+        logger.info("Найдено %s нарушений", len(violations))
         return violations
     
     def _analyze_with_mask(
@@ -111,50 +110,67 @@ class ViolationAnalyzer:
         cadastral_parcels: List[CadastralParcel],
         geotiff_data: GeoTiffData
     ) -> List[Violation]:
-        """Анализ с использованием растровой маски кадастра."""
-        # Создаём маску кадастра
-        cadastral_mask = self._create_cadastral_mask(
-            cadastral_parcels,
-            geotiff_data
+        """
+        Пайплайн по маскам (шаги 1–5):
+        1) маска объекта - маска кадастра (весь кадастр)
+        2) маски -> полигоны (с упрощением)
+        3) split полигона по границам ЗУ (линии)
+        4) привязка каждого куска по nearest (distance-first)
+        5) (опционально) union по участку делается в analyze()
+        """
+        from shapely.ops import unary_union
+
+        cadastral_mask = self._create_cadastral_mask(cadastral_parcels, geotiff_data)
+
+        boundary_splitter: Optional[BaseGeometry] = None
+        if len(cadastral_parcels) >= 2:
+            try:
+                boundary_splitter = unary_union([p.geometry.boundary for p in cadastral_parcels])
+            except Exception as e:
+                logger.debug("Границы ЗУ для split: %s", e)
+
+        geom_processor = GeometryProcessor(
+            simplify_tolerance=self.config.simplify_tolerance_m,
+            cv_eps_factor=self.config.cv_eps_factor,
         )
-        
-        violations = []
-        
+
+        violations: List[Violation] = []
         for obj in detected_objects:
-            # Находим область нарушения (вне кадастра)
-            violation_geom = self._find_violation_geometry(
-                obj.geometry,
-                cadastral_mask,
-                geotiff_data.transform
-            )
-            
-            if not violation_geom or violation_geom.is_empty:
+            try:
+                obj_polys = self._find_violation_polygons_from_masks(
+                    obj.geometry, cadastral_mask, geotiff_data, geom_processor
+                )
+                if not obj_polys:
+                    continue
+
+                for poly in obj_polys:
+                    for part in self._split_violation_by_cadastral_boundaries(poly, boundary_splitter):
+                        if part.is_empty:
+                            continue
+                        va = float(part.area)
+                        if va < self.config.min_violation_area:
+                            continue
+
+                        parcel, dist = self.matcher.match_nearest_unlimited(part, cadastral_parcels)
+                        if parcel is None:
+                            continue
+
+                        violations.append(
+                            Violation(
+                                geometry=part,
+                                violation_area=va,
+                                detected_object=obj,
+                                parcel=parcel,
+                                binding_type="nearest",
+                                binding_distance=float(dist),
+                                intersection_ratio=0.0,
+                                original_object_area=obj.area_sqm,
+                            )
+                        )
+            except Exception as e:
+                logger.warning("Ошибка mask-анализа объекта %s: %s", obj.instance_id, e)
                 continue
-            
-            violation_area = violation_geom.area
-            
-            if violation_area < self.config.min_violation_area:
-                continue
-            
-            # Привязываем к участку
-            parcel, binding_type, distance, ratio = self.matcher.match(
-                violation_geom,
-                cadastral_parcels
-            )
-            
-            violation = Violation(
-                geometry=violation_geom,
-                violation_area=violation_area,
-                detected_object=obj,
-                parcel=parcel,
-                binding_type=binding_type,
-                binding_distance=distance,
-                intersection_ratio=ratio,
-                original_object_area=obj.area_sqm
-            )
-            
-            violations.append(violation)
-        
+
         return violations
     
     def _analyze_vector(
@@ -162,131 +178,51 @@ class ViolationAnalyzer:
         detected_objects: List[DetectedObject],
         cadastral_parcels: List[CadastralParcel]
     ) -> List[Violation]:
-        """Анализ с использованием векторных операций Shapely."""
-        # Объединяем все кадастровые участки
-        try:
-            cadastral_union = unary_union([p.geometry for p in cadastral_parcels])
-        except Exception as e:
-            logger.error(f"Ошибка объединения кадастра: {e}")
-            return []
-
-        boundary_splitter: Optional[BaseGeometry] = None
-        if len(cadastral_parcels) >= 2:
-            try:
-                boundary_splitter = unary_union(
-                    [p.geometry.boundary for p in cadastral_parcels]
-                )
-            except Exception as e:
-                logger.debug("Границы ЗУ для split: %s", e)
-
-        violations = []
-        
+        """
+        Вариант: сначала выбираем кадастровый участок для исходного объекта, затем
+        вычитаем геометрию ЭТОГО участка и считаем остаток нарушением.
+        """
+        violations: List[Violation] = []
         for obj in detected_objects:
-            # Вычитаем кадастр из обнаруженного объекта
             try:
-                violation_geom = obj.geometry.difference(cadastral_union)
-                
-                if violation_geom.is_empty:
+                # 1) Привязка исходного объекта к участку
+                parcel, binding_type, distance, ratio = self.matcher.match(
+                    obj.geometry, cadastral_parcels
+                )
+                if parcel is None:
                     continue
 
-                parts = self._polygon_parts_from_difference(violation_geom)
+                # 2) Нарушение = часть объекта вне выбранного участка
+                diff = obj.geometry.difference(parcel.geometry)
+                if diff.is_empty:
+                    continue
+
+                parts = self._polygon_parts_from_difference(diff)
                 if not parts:
                     continue
 
-                for part in parts:
-                    for sub in self._split_violation_by_cadastral_boundaries(
-                        part, boundary_splitter
-                    ):
-                        grid_assigned = self._assign_violation_centroid_grid(
-                            sub, cadastral_parcels
-                        )
-                        if grid_assigned:
-                            emitted_geoms: List[Polygon] = []
-                            for gpoly, parcel in grid_assigned:
-                                va = float(gpoly.area)
-                                if va < self.config.min_violation_area:
-                                    continue
-                                if parcel is None:
-                                    continue
-                                try:
-                                    d_bind = float(gpoly.distance(parcel.geometry))
-                                except Exception:
-                                    d_bind = 0.0
-                                emitted_geoms.append(gpoly)
-                                violations.append(
-                                    Violation(
-                                        geometry=gpoly,
-                                        violation_area=va,
-                                        detected_object=obj,
-                                        parcel=parcel,
-                                        binding_type="centroid_grid",
-                                        binding_distance=d_bind,
-                                        intersection_ratio=0.0,
-                                        original_object_area=obj.area_sqm,
-                                    )
-                                )
-                            if emitted_geoms:
-                                try:
-                                    cover = unary_union(emitted_geoms)
-                                    rem = sub.difference(cover).buffer(0)
-                                    for rp in self._polygon_parts_from_difference(rem):
-                                        if rp.area < self.config.min_violation_area:
-                                            continue
-                                        (
-                                            parcel_r,
-                                            bt_r,
-                                            dist_r,
-                                            ratio_r,
-                                        ) = self._bind_parcel_with_relaxed_fallback(
-                                            rp, cadastral_parcels
-                                        )
-                                        if parcel_r is None:
-                                            continue
-                                        violations.append(
-                                            Violation(
-                                                geometry=rp,
-                                                violation_area=float(rp.area),
-                                                detected_object=obj,
-                                                parcel=parcel_r,
-                                                binding_type=bt_r,
-                                                binding_distance=dist_r,
-                                                intersection_ratio=ratio_r,
-                                                original_object_area=obj.area_sqm,
-                                            )
-                                        )
-                                except Exception as e:
-                                    logger.debug("Остаток нарушения после сетки: %s", e)
-                            continue
+                # Берём самый большой полигон нарушения (как и раньше)
+                violation_geom = max(parts, key=lambda p: float(p.area))
+                va = float(violation_geom.area)
+                if va < self.config.min_violation_area:
+                    continue
 
-                        violation_area = sub.area
-                        if violation_area < self.config.min_violation_area:
-                            continue
-
-                        parcel, binding_type, distance, ratio = (
-                            self._bind_parcel_with_relaxed_fallback(
-                                sub, cadastral_parcels
-                            )
-                        )
-                        if parcel is None:
-                            continue
-
-                        violation = Violation(
-                            geometry=sub,
-                            violation_area=violation_area,
-                            detected_object=obj,
-                            parcel=parcel,
-                            binding_type=binding_type,
-                            binding_distance=distance,
-                            intersection_ratio=ratio,
-                            original_object_area=obj.area_sqm,
-                        )
-
-                        violations.append(violation)
-                
+                violations.append(
+                    Violation(
+                        geometry=violation_geom,
+                        violation_area=va,
+                        detected_object=obj,
+                        parcel=parcel,
+                        binding_type=binding_type,
+                        binding_distance=distance,
+                        intersection_ratio=ratio,
+                        original_object_area=obj.area_sqm,
+                    )
+                )
             except Exception as e:
-                logger.warning(f"Ошибка обработки объекта {obj.instance_id}: {e}")
+                logger.warning("Ошибка обработки объекта %s: %s", obj.instance_id, e)
                 continue
-        
+
         return violations
 
     @staticmethod
@@ -580,8 +516,8 @@ class ViolationAnalyzer:
         
         Растеризует объект, вычитает маску кадастра, векторизует обратно.
         """
+        # Legacy helper (не используется в новом пайплайне _analyze_with_mask).
         from ..utils.geometry_utils import geo_to_pixel_coords, pixel_to_geo_coords
-        from ..processing.geometry_processor import GeometryProcessor
         
         try:
             # Конвертируем в пиксельные координаты
@@ -601,10 +537,18 @@ class ViolationAnalyzer:
                 return None
             
             # Векторизуем маску обратно в полигон
-            geom_processor = GeometryProcessor()
+            geom_processor = GeometryProcessor(
+                simplify_tolerance=self.config.simplify_tolerance_m,
+                cv_eps_factor=self.config.cv_eps_factor,
+            )
+            # min_area в пикселях: грубый fallback по размеру пикселя (transform[1], transform[5])
+            pxw = float(abs(transform[1])) if len(transform) > 1 else 1.0
+            pxh = float(abs(transform[5])) if len(transform) > 5 else 1.0
+            pixel_area = max(1e-9, pxw * pxh)
+            min_area_px = float(self.config.min_violation_area) / pixel_area
             violation_polygons = geom_processor.extract_polygons_from_mask(
                 violation_mask,
-                min_area=self.config.min_violation_area / (abs(transform[0]) * abs(transform[4]))  # пиксели
+                min_area=min_area_px,
             )
             
             if not violation_polygons:
@@ -616,12 +560,62 @@ class ViolationAnalyzer:
             # Конвертируем обратно в гео-координаты
             pixel_coords_list = largest_pixel_poly.reshape(-1, 2).tolist()
             geo_coords = pixel_to_geo_coords(pixel_coords_list, transform)
-            
             return Polygon(geo_coords)
             
         except Exception as e:
             logger.debug(f"Ошибка в _find_violation_geometry: {e}, используем весь объект")
             return obj_geometry
+
+    def _find_violation_polygons_from_masks(
+        self,
+        obj_geometry: Polygon,
+        cadastral_mask: np.ndarray,
+        geotiff_data: GeoTiffData,
+        geom_processor: GeometryProcessor,
+    ) -> List[Polygon]:
+        """
+        Возвращает список полигонов нарушения по маскам:
+        mask(obj) \\ mask(cadastre) → контуры → geo-полигоны (с упрощением в GeometryProcessor).
+        """
+        from ..utils.geometry_utils import geo_to_pixel_coords
+
+        try:
+            exterior_coords = list(obj_geometry.exterior.coords)
+            pixel_coords = geo_to_pixel_coords(exterior_coords, geotiff_data.transform)
+
+            h, w = cadastral_mask.shape
+            obj_mask = np.zeros((h, w), dtype=np.uint8)
+            cv2.fillPoly(obj_mask, [pixel_coords.astype(np.int32)], 1)
+
+            violation_mask = cv2.bitwise_and(obj_mask, cv2.bitwise_not(cadastral_mask))
+            if not violation_mask.any():
+                return []
+
+            # min_area в пикселях: min_violation_area / pixel_area_sqm
+            pixel_area = float(getattr(geotiff_data, "pixel_area_sqm", 0.0) or 0.0)
+            if pixel_area <= 0:
+                # fallback: считаем, что единицы в метрах и transform даёт размер пикселя
+                try:
+                    pxw = float(abs(geotiff_data.transform[1]))
+                    pxh = float(abs(geotiff_data.transform[5]))
+                    pixel_area = max(1e-9, pxw * pxh)
+                except Exception:
+                    pixel_area = 1.0
+            min_area_px = float(self.config.min_violation_area) / max(pixel_area, 1e-9)
+
+            pixel_polys = geom_processor.extract_polygons_from_mask(
+                violation_mask, min_area=min_area_px
+            )
+            out: List[Polygon] = []
+            for pp in pixel_polys:
+                g = geom_processor.convert_to_geo_polygon(pp, geotiff_data.transform)
+                if g.is_empty or g.area <= 0:
+                    continue
+                out.append(g)
+            return out
+        except Exception as e:
+            logger.debug("Ошибка в _find_violation_polygons_from_masks: %s", e)
+            return []
     
     def _create_unmatched_violations(
         self,

@@ -48,30 +48,22 @@ class CadastralMatcher:
         if not cadastral_parcels:
             return None, "none", 0.0, 0.0
         
-        # Метод 1: Пересечение
-        parcel, ratio = self._match_by_intersection(
-            violation_geometry,
-            cadastral_parcels
-        )
-        if parcel:
-            return parcel, "intersection", 0.0, ratio
-        
-        # Метод 2: Касание границы
-        parcel, distance = self._match_by_boundary(
-            violation_geometry,
-            cadastral_parcels
-        )
-        if parcel:
-            return parcel, "boundary", distance, 0.0
-        
-        # Метод 3: Ближайший участок
-        parcel, distance = self._match_by_nearest(
-            violation_geometry,
-            cadastral_parcels
-        )
+        # Вариант A: в приоритете расстояние до ближайшего участка.
+        # 1) nearest (в пределах max_nearest_distance_m)
+        parcel, distance = self._match_by_nearest(violation_geometry, cadastral_parcels)
         if parcel:
             return parcel, "nearest", distance, 0.0
-        
+
+        # 2) boundary (в пределах boundary_buffer_m)
+        parcel, distance = self._match_by_boundary(violation_geometry, cadastral_parcels)
+        if parcel:
+            return parcel, "boundary", distance, 0.0
+
+        # 3) intersection (fallback)
+        parcel, ratio = self._match_by_intersection(violation_geometry, cadastral_parcels)
+        if parcel:
+            return parcel, "intersection", 0.0, ratio
+
         return None, "none", 0.0, 0.0
     
     def _match_by_intersection(

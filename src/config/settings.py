@@ -53,6 +53,9 @@ class AnalysisConfig:
     # Дедупликация
     overlap_threshold: float = DEFAULT_OVERLAP_THRESHOLD
 
+    # Нарушения: объединять фрагменты одного участка в одну запись (union)
+    merge_violations_per_parcel: bool = DEFAULT_MERGE_VIOLATIONS_PER_PARCEL
+
     # Карта overview: макс. длина стороны подложки в пикселях (снижает память).
     # None — без прореживания (только при достаточной RAM; иначе процесс могут убить).
     map_max_raster_edge: Optional[int] = DEFAULT_MAP_MAX_RASTER_EDGE

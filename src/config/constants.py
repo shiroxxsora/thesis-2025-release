@@ -18,6 +18,9 @@ DEFAULT_INTERSECTION_RATIO = 0.1
 DEFAULT_BOUNDARY_BUFFER_M = 3.0
 DEFAULT_MAX_DISTANCE_M = 25.0
 
+# Нарушения: объединять фрагменты одного кадастрового участка (union) в одну запись
+DEFAULT_MERGE_VIOLATIONS_PER_PARCEL = False
+
 # Упрощение геометрии
 DEFAULT_SIMPLIFY_TOLERANCE_M = 0.5
 DEFAULT_CV_EPS_FACTOR = 0.004
