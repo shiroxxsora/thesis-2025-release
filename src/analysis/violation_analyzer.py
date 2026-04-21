@@ -581,13 +581,37 @@ class ViolationAnalyzer:
 
         try:
             exterior_coords = list(obj_geometry.exterior.coords)
-            pixel_coords = geo_to_pixel_coords(exterior_coords, geotiff_data.transform)
+            pixel_coords_f = geo_to_pixel_coords(exterior_coords, geotiff_data.transform)
+            if pixel_coords_f.size == 0:
+                return []
 
-            h, w = cadastral_mask.shape
-            obj_mask = np.zeros((h, w), dtype=np.uint8)
+            # Растеризуем объект только в окне bbox (ROI), чтобы не аллоцировать маску на весь растр.
+            img_h, img_w = cadastral_mask.shape
+            xs = pixel_coords_f[:, 0]
+            ys = pixel_coords_f[:, 1]
+            x0 = int(np.floor(np.min(xs)))
+            x1 = int(np.ceil(np.max(xs)))
+            y0 = int(np.floor(np.min(ys)))
+            y1 = int(np.ceil(np.max(ys)))
+
+            pad = 2  # небольшой запас на округления/approxPolyDP
+            x0 = max(0, x0 - pad)
+            y0 = max(0, y0 - pad)
+            x1 = min(img_w - 1, x1 + pad)
+            y1 = min(img_h - 1, y1 + pad)
+            if x1 <= x0 or y1 <= y0:
+                return []
+
+            roi_w = x1 - x0 + 1
+            roi_h = y1 - y0 + 1
+
+            pixel_coords = pixel_coords_f - np.array([x0, y0], dtype=pixel_coords_f.dtype)
+
+            obj_mask = np.zeros((roi_h, roi_w), dtype=np.uint8)
             cv2.fillPoly(obj_mask, [pixel_coords.astype(np.int32)], 1)
 
-            violation_mask = cv2.bitwise_and(obj_mask, cv2.bitwise_not(cadastral_mask))
+            cad_roi = cadastral_mask[y0 : y1 + 1, x0 : x1 + 1]
+            violation_mask = cv2.bitwise_and(obj_mask, cv2.bitwise_not(cad_roi))
             if not violation_mask.any():
                 return []
 
@@ -603,12 +627,11 @@ class ViolationAnalyzer:
                     pixel_area = 1.0
             min_area_px = float(self.config.min_violation_area) / max(pixel_area, 1e-9)
 
-            pixel_polys = geom_processor.extract_polygons_from_mask(
-                violation_mask, min_area=min_area_px
-            )
+            pixel_polys = geom_processor.extract_polygons_from_mask(violation_mask, min_area=min_area_px)
             out: List[Polygon] = []
             for pp in pixel_polys:
-                g = geom_processor.convert_to_geo_polygon(pp, geotiff_data.transform)
+                # offset — позиция ROI внутри полного растра
+                g = geom_processor.convert_to_geo_polygon(pp, geotiff_data.transform, offset=(x0, y0))
                 if g.is_empty or g.area <= 0:
                     continue
                 out.append(g)
