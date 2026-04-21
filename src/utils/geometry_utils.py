@@ -82,6 +82,11 @@ def simplify_polygon(
         # Проверка валидности
         if not simplified.is_valid:
             simplified = make_valid(simplified)
+
+        # После make_valid/simplify может получиться не полигональная геометрия (LineString/Collection).
+        # В этом случае лучше вернуть исходный полигон, чем сломать дальнейший пайплайн.
+        if simplified.geom_type not in ("Polygon", "MultiPolygon"):
+            return polygon
         
         # Если упрощение слишком агрессивное, возвращаем оригинал
         if simplified.is_empty or simplified.area < polygon.area * 0.1:

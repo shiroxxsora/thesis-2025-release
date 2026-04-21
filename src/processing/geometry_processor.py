@@ -110,6 +110,12 @@ class GeometryProcessor:
                     self.simplify_tolerance,
                     preserve_topology=True
                 )
+
+            # simplify/make_valid могут вернуть MultiPolygon/не-полигон — оставляем только полигональную часть
+            if polygon.geom_type == "MultiPolygon" and getattr(polygon, "geoms", None):
+                polygon = max(polygon.geoms, key=lambda p: p.area)
+            if polygon.geom_type != "Polygon":
+                return Polygon()
             
             # Валидируем и исправляем если нужно
             if not polygon.is_valid:

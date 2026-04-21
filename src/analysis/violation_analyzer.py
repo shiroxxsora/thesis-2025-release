@@ -632,7 +632,7 @@ class ViolationAnalyzer:
             for pp in pixel_polys:
                 # offset — позиция ROI внутри полного растра
                 g = geom_processor.convert_to_geo_polygon(pp, geotiff_data.transform, offset=(x0, y0))
-                if g.is_empty or g.area <= 0:
+                if g.is_empty or g.area <= 0 or g.geom_type not in ("Polygon", "MultiPolygon"):
                     continue
                 out.append(g)
             return out
