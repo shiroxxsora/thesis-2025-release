@@ -65,6 +65,12 @@ class _StickerPlacer:
         self._bounds = map_bounds
         self._items: List[Tuple[float, float, float, float]] = []
 
+    def _fits(self, cx: float, cy: float, hw: float, hh: float) -> bool:
+        for px, py, phw, phh in self._items:
+            if abs(cx - px) < hw + phw and abs(cy - py) < hh + phh:
+                return False
+        return True
+
     def try_place(
         self,
         cx: float,
@@ -72,15 +78,44 @@ class _StickerPlacer:
         line1: str,
         line2: str,
         clearance: float = 1.08,
-    ) -> bool:
+    ) -> Optional[Tuple[float, float]]:
         hw, hh = _sticker_half_extents_data(self._bounds, line1, line2)
         hw *= clearance
         hh *= clearance
-        for px, py, phw, phh in self._items:
-            if abs(cx - px) < hw + phw and abs(cy - py) < hh + phh:
-                return False
-        self._items.append((cx, cy, hw, hh))
-        return True
+
+        # 1) пробуем как есть
+        if self._fits(cx, cy, hw, hh):
+            self._items.append((cx, cy, hw, hh))
+            return cx, cy
+
+        # 2) пробуем сдвиги (кольца) вокруг исходной точки
+        minx, miny, maxx, maxy = self._bounds
+        span_x = max(maxx - minx, 1e-9)
+        span_y = max(maxy - miny, 1e-9)
+        step_x = max(hw * 0.85, span_x * 0.006)
+        step_y = max(hh * 0.85, span_y * 0.006)
+
+        for ring in range(1, 8):
+            dx = ring * step_x
+            dy = ring * step_y
+            candidates = [
+                (cx + dx, cy),
+                (cx - dx, cy),
+                (cx, cy + dy),
+                (cx, cy - dy),
+                (cx + dx, cy + dy),
+                (cx + dx, cy - dy),
+                (cx - dx, cy + dy),
+                (cx - dx, cy - dy),
+            ]
+            for nx, ny in candidates:
+                if nx < minx or nx > maxx or ny < miny or ny > maxy:
+                    continue
+                if self._fits(nx, ny, hw, hh):
+                    self._items.append((nx, ny, hw, hh))
+                    return nx, ny
+
+        return None
 
 
 def _geometry_label_xy(geom: BaseGeometry) -> Tuple[float, float]:
@@ -641,9 +676,11 @@ class MapVisualizer:
                 x, y = _geometry_label_xy(violation.geometry)
                 l1 = f"{violation.violation_area:.1f} м²"
                 l2 = _cadastral_line(violation.parcel)
-                if not placer.try_place(x, y, l1, l2):
+                xy = placer.try_place(x, y, l1, l2)
+                if xy is None:
                     skipped_v += 1
                     continue
+                x, y = xy
                 _draw_sticker_label(
                     ax,
                     x,
@@ -665,9 +702,11 @@ class MapVisualizer:
                 parcel, _, _, _ = matcher.match(obj.geometry, cadastral_parcels)
                 l1 = f"{obj.area_sqm:.1f} м²"
                 l2 = _cadastral_line(parcel)
-                if not placer.try_place(cx, cy, l1, l2):
+                xy = placer.try_place(cx, cy, l1, l2)
+                if xy is None:
                     skipped_o += 1
                     continue
+                cx, cy = xy
                 _draw_sticker_label(
                     ax,
                     cx,
