@@ -49,12 +49,12 @@ class AnalysisConfig:
     binding_min_intersection_ratio: float = DEFAULT_INTERSECTION_RATIO
     binding_boundary_buffer_m: float = DEFAULT_BOUNDARY_BUFFER_M
     binding_max_nearest_distance_m: float = DEFAULT_MAX_DISTANCE_M
+
+    # Один ряд в Excel / per_parcel на ЗУ: unary_union всех фрагментов с одной привязкой
+    merge_violations_per_parcel: bool = True
     
     # Дедупликация
     overlap_threshold: float = DEFAULT_OVERLAP_THRESHOLD
-
-    # Нарушения: объединять фрагменты одного участка в одну запись (union)
-    merge_violations_per_parcel: bool = DEFAULT_MERGE_VIOLATIONS_PER_PARCEL
 
     # Карта overview: макс. длина стороны подложки в пикселях (снижает память).
     # None — без прореживания (только при достаточной RAM; иначе процесс могут убить).
@@ -79,12 +79,12 @@ class VisualizationConfig:
     
     # Цвета
     cadastral_edge_color: str = 'blue'
-    detected_face_color: str = 'green'
+    detected_face_color: str = 'yellow'
     detected_alpha: float = 0.4
     violation_face_color: str = 'red'
-    violation_alpha: float = 0.8
+    violation_alpha: float = 0.6
     
     # Размеры линий
     cadastral_linewidth: float = 0.8
     detected_linewidth: float = 0.5
-    violation_linewidth: float = 1.0
+    violation_linewidth: float = 0.5

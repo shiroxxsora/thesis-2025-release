@@ -65,6 +65,36 @@ class CadastralReader(DataReader[List[CadastralParcel]]):
                 source_crs = self._determine_source_crs(layer, target_crs)
                 self.transformer = CoordinateTransformer(source_crs, target_crs)
                 self._crs_same_as_target = not self.transformer.needs_transformation
+
+                # Авто-фикс для МСК: если x_0 отличается на ~4e6 и по bbox видно, что кадастр уехал,
+                # включаем ручной сдвиг по X, чтобы объекты попали в область растра.
+                if target_bounds and self.transformer and abs(getattr(self.transformer, "zone_offset", 0.0)) > 1_000_000:
+                    try:
+                        raster_cx = (float(target_bounds[0]) + float(target_bounds[2])) / 2.0
+                        layer.ResetReading()
+                        sample_centers = []
+                        for i, f in enumerate(layer):
+                            if i >= 3:
+                                break
+                            g = f.GetGeometryRef()
+                            if not g:
+                                continue
+                            env = g.GetEnvelope()  # (minx, maxx, miny, maxy)
+                            sample_centers.append((env[0] + env[1]) / 2.0)
+                        layer.ResetReading()
+                        if sample_centers:
+                            cad_cx = float(sum(sample_centers) / len(sample_centers))
+                            diff = cad_cx - raster_cx
+                            z = float(self.transformer.zone_offset)
+                            # Если разница по X близка к зонному сдвигу — применяем его.
+                            if abs(diff - z) < 500_000.0:
+                                self.transformer.enable_manual_zone_shift()
+                                self._crs_same_as_target = False
+                    except Exception:
+                        try:
+                            layer.ResetReading()
+                        except Exception:
+                            pass
             
             # Создаём bbox для фильтрации
             target_bbox = None

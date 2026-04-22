@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 
 from shapely import wkt as shapely_wkt
-from shapely.geometry import Polygon, MultiPolygon, box
+from shapely.geometry import Polygon, MultiPolygon, GeometryCollection, box
 from shapely.ops import transform, unary_union
 
 try:
@@ -97,6 +97,7 @@ class MapGenerator:
         viol_coords_df: pd.DataFrame,
         save_path: str,
         proj_string: Optional[str] = None,
+        merge_violations_per_parcel: bool = True,
     ) -> None:
         """
         Создаёт zoom-карту с увеличением на нарушения конкретного участка.
@@ -108,6 +109,8 @@ class MapGenerator:
             viol_coords_df: DataFrame с координатами нарушений
             save_path: Путь для сохранения PNG
             proj_string: PROJ-строка исходной СК (опционально)
+            merge_violations_per_parcel: True — один union на КН (как при merge в анализе);
+                False — отдельный полигон на каждую строку отчёта.
         """
         v = violations_df[violations_df['Ближайший кадастровый номер'] == cadastral_number]
         if v.empty:
@@ -133,14 +136,24 @@ class MapGenerator:
 
         # Перепроецирование
         project = self._setup_projection(proj_string)
+        plot_geoms: List = []
         if project:
             try:
-                geoms = [transform(project, g) for g in geoms]
                 if parcel_geom:
                     parcel_geom = transform(project, parcel_geom)
+                if merge_violations_per_parcel:
+                    merged = geoms[0] if len(geoms) == 1 else unary_union(geoms)
+                    plot_geoms = [transform(project, merged)]
+                else:
+                    plot_geoms = [transform(project, g) for g in geoms]
             except Exception as e:
                 logger.warning(f"Ошибка при перепроецировании геометрий: {e}")
                 return
+        else:
+            if merge_violations_per_parcel:
+                plot_geoms = [geoms[0] if len(geoms) == 1 else unary_union(geoms)]
+            else:
+                plot_geoms = list(geoms)
 
         # Подложка
         self._draw_background(ax)
@@ -149,8 +162,10 @@ class MapGenerator:
         if parcel_geom is not None and not parcel_geom.is_empty:
             self._plot_shapely(ax, parcel_geom, facecolor='none', edgecolor='blue', linewidth=0.8, alpha=0.9)
 
-        # Нарушения
-        for g in geoms:
+        # Нарушения: union на КН или по строкам отчёта
+        for g in plot_geoms:
+            if g is None or g.is_empty:
+                continue
             self._plot_shapely(ax, g, facecolor='red', edgecolor='darkred', linewidth=0.5, alpha=0.6)
 
         # Центроиды нарушений
@@ -163,7 +178,7 @@ class MapGenerator:
         )
 
         # Масштаб
-        self._set_zoom_scale(ax, geoms, parcel_geom)
+        self._set_zoom_scale(ax, [x for x in plot_geoms if x is not None and not x.is_empty], parcel_geom)
 
         ax.set_aspect('equal', adjustable='box')
         ax.axis('off')
@@ -179,6 +194,7 @@ class MapGenerator:
         viol_coords_df: pd.DataFrame,
         save_path: str,
         proj_string: Optional[str] = None,
+        merge_violations_per_parcel: bool = True,
     ) -> None:
         """
         Создаёт обзорную карту участка с окружением.
@@ -190,6 +206,8 @@ class MapGenerator:
             viol_coords_df: DataFrame с координатами нарушений
             save_path: Путь для сохранения PNG
             proj_string: PROJ-строка исходной СК (опционально)
+            merge_violations_per_parcel: True — один union на карте; False — отдельные полигоны,
+                площадь на подписи = сумма столбца «Площадь нарушения, м²» (как в Excel).
         """
         v = violations_df[violations_df['Ближайший кадастровый номер'] == cadastral_number]
         
@@ -212,12 +230,14 @@ class MapGenerator:
                     geoms.append(geom)
                 except Exception:
                     pass
+
+        viol_union_for_aoi = unary_union(geoms) if geoms else None
         
         # Область интереса с буфером
         area_of_interest = parcel_geom
         buffer_distance = 0
-        if geoms:
-            all_geoms_combined = unary_union([parcel_geom] + geoms)
+        if viol_union_for_aoi is not None and not viol_union_for_aoi.is_empty:
+            all_geoms_combined = unary_union([parcel_geom, viol_union_for_aoi])
             buffer_distance = max(
                 parcel_geom.bounds[2] - parcel_geom.bounds[0],
                 parcel_geom.bounds[3] - parcel_geom.bounds[1]
@@ -231,16 +251,33 @@ class MapGenerator:
         
         fig, ax = plt.subplots(figsize=(8, 8), dpi=150)
         
-        # Перепроецирование
+        # Перепроецирование и список геометрий для отрисовки
         project = self._setup_projection(proj_string)
+        plot_geoms: List = []
         if project:
             try:
                 parcel_geom = transform(project, parcel_geom)
-                geoms = [transform(project, g) for g in geoms]
+                if geoms:
+                    if merge_violations_per_parcel:
+                        u = geoms[0] if len(geoms) == 1 else unary_union(geoms)
+                        if not u.is_empty:
+                            plot_geoms = [transform(project, u)]
+                    else:
+                        plot_geoms = [
+                            transform(project, g) for g in geoms if g is not None and not g.is_empty
+                        ]
                 for info in all_cadastral_info:
                     info['geom'] = transform(project, info['geom'])
-            except Exception:
+            except Exception as e:
+                logger.exception("Обзорная карта: ошибка перепроецирования: %s", e)
                 return
+        else:
+            if geoms:
+                if merge_violations_per_parcel:
+                    u = geoms[0] if len(geoms) == 1 else unary_union(geoms)
+                    plot_geoms = [u] if not u.is_empty else []
+                else:
+                    plot_geoms = [g for g in geoms if g is not None and not g.is_empty]
         
         # Подложка
         self._draw_background(ax)
@@ -254,8 +291,12 @@ class MapGenerator:
         
         # Подпись участка
         cadastral_area = self._get_cadastral_area(cad_row)
-        # На участок одна строка нарушения (union); sum() на случай нескольких строк в старых отчётах
-        total_violation_area = float(v['Площадь нарушения, м²'].fillna(0).sum()) if not v.empty else 0
+        if merge_violations_per_parcel and plot_geoms:
+            total_violation_area = float(plot_geoms[0].area)
+        elif not v.empty and 'Площадь нарушения, м²' in v.columns:
+            total_violation_area = float(v['Площадь нарушения, м²'].fillna(0).sum())
+        else:
+            total_violation_area = 0.0
         
         centroid = parcel_geom.centroid
         ax.text(
@@ -265,8 +306,9 @@ class MapGenerator:
             bbox=dict(boxstyle='round,pad=0.5', facecolor='white', edgecolor='blue', alpha=0.9)
         )
         
-        # Нарушения
-        for g in geoms:
+        for g in plot_geoms:
+            if g is None or g.is_empty:
+                continue
             self._plot_shapely(ax, g, facecolor='red', edgecolor='darkred', linewidth=1.0, alpha=0.5)
         
         # Нумерация точек нарушений (координаты уже упрощены в Excel)
@@ -276,7 +318,7 @@ class MapGenerator:
         )
         
         # Масштаб
-        self._set_overview_scale(ax, all_cadastral_info, geoms)
+        self._set_overview_scale(ax, all_cadastral_info, plot_geoms)
         
         ax.set_aspect('equal', adjustable='box')
         ax.set_title(f'Обзорная карта участка {cadastral_number}', fontsize=10, weight='bold')
@@ -596,6 +638,18 @@ class MapGenerator:
         if isinstance(geom, MultiPolygon):
             for g in geom.geoms:
                 MapGenerator._plot_shapely(ax, g, facecolor, edgecolor, linewidth, alpha)
+            return
+
+        if isinstance(geom, GeometryCollection):
+            polys = [
+                g for g in geom.geoms
+                if g.geom_type in ("Polygon", "MultiPolygon") and not g.is_empty
+            ]
+            if not polys:
+                return
+            MapGenerator._plot_shapely(
+                ax, unary_union(polys), facecolor, edgecolor, linewidth, alpha
+            )
             return
         
         if isinstance(geom, Polygon):

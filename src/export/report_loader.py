@@ -31,34 +31,20 @@ class ReportLoader:
         xls = pd.ExcelFile(report_path)
         logger.info(f"Найдены листы: {xls.sheet_names}")
 
-        # Листы по именам из ExcelWriter
-        try:
-            cadastral_df = pd.read_excel(xls, sheet_name='2. Кадастровые участки')
-            logger.info(f"'2. Кадастровые участки': {len(cadastral_df)} строк")
-        except Exception as e:
-            logger.error(f"Не удалось прочитать лист '2. Кадастровые участки': {e}")
-            raise
+        # Листы по именам из ExcelWriter (некоторые могут отсутствовать, если данных 0)
+        def _read_or_empty(name: str) -> pd.DataFrame:
+            try:
+                df = pd.read_excel(xls, sheet_name=name)
+                logger.info("'%s': %s строк", name, len(df))
+                return df
+            except Exception as e:
+                logger.warning("Лист '%s' не прочитан (%s). Возвращаю пустой DataFrame.", name, e)
+                return pd.DataFrame()
 
-        try:
-            violations_df = pd.read_excel(xls, sheet_name='3. Нарушения')
-            logger.info(f"'3. Нарушения': {len(violations_df)} строк")
-        except Exception as e:
-            logger.error(f"Не удалось прочитать лист '3. Нарушения': {e}")
-            raise
-
-        try:
-            coords_df = pd.read_excel(xls, sheet_name='4. Координаты участков')
-            logger.info(f"'4. Координаты участков': {len(coords_df)} строк")
-        except Exception as e:
-            logger.error(f"Не удалось прочитать лист '4. Координаты участков': {e}")
-            raise
-
-        try:
-            viol_coords_df = pd.read_excel(xls, sheet_name='5. Координаты нарушений')
-            logger.info(f"'5. Координаты нарушений': {len(viol_coords_df)} строк")
-        except Exception as e:
-            logger.error(f"Не удалось прочитать лист '5. Координаты нарушений': {e}")
-            raise
+        cadastral_df = _read_or_empty('2. Кадастровые участки')
+        violations_df = _read_or_empty('3. Нарушения')
+        coords_df = _read_or_empty('4. Координаты участков')
+        viol_coords_df = _read_or_empty('5. Координаты нарушений')
 
         return {
             'cadastral_df': cadastral_df,

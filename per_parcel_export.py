@@ -75,6 +75,11 @@ def main():
         default=None,
         help='PROJ-строка для исходной системы координат векторов'
     )
+    parser.add_argument(
+        '--separate-violation-maps',
+        action='store_true',
+        help='Не объединять нарушения на картах (если в report.xlsx несколько строк на один КН)',
+    )
     
     args = parser.parse_args()
     
@@ -89,6 +94,7 @@ def main():
             font_path=args.font,
             geotiff_path=args.geotiff,
             proj_string=args.proj_string,
+            merge_violations_per_parcel=not args.separate_violation_maps,
         )
         
         output_path = exporter.export(

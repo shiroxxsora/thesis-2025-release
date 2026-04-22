@@ -78,7 +78,10 @@ class ComprehensiveAnalyzer:
         self.pdf_generator = PDFReportGenerator(self.config.output_dir)
         
         # Export
-        self.parcel_exporter = ParcelExporter(self.config.output_dir)
+        self.parcel_exporter = ParcelExporter(
+            self.config.output_dir,
+            merge_violations_per_parcel=self.config.merge_violations_per_parcel,
+        )
     
     def run_analysis(self) -> AnalysisResult:
         """

@@ -52,10 +52,11 @@ class ViolationAnalyzer:
 
     @staticmethod
     def _merge_group_key(parcel: CadastralParcel) -> Tuple[Any, ...]:
-        """Ключ для union по ЗУ: различаем участки с одним КН при наличии object_id."""
-        if parcel.object_id is not None:
-            return ("id", parcel.object_id, parcel.cadastral_number)
-        return ("cn", parcel.cadastral_number)
+        """Один ключ на кадастровый номер: одно нарушение на ЗУ (Excel и карты фильтруют по КН)."""
+        cn = (parcel.cadastral_number or "").strip()
+        if not cn:
+            return ("cn_missing", id(parcel))
+        return ("cn", cn)
     
     def analyze(
         self,
@@ -72,8 +73,9 @@ class ViolationAnalyzer:
             geotiff_data: Данные GeoTIFF (для mask-based анализа)
             
         Returns:
-            Список нарушений (без объединения «один на ЗУ»): каждый объект даёт максимум
-            один полигон нарушения, который затем привязывается к кадастровому участку.
+            Список нарушений. При ``merge_violations_per_parcel`` — ровно одна запись на
+            кадастровый номер (``unary_union`` всех фрагментов с этим КН); иначе — отдельные
+            фрагменты после split/vector-анализа.
         """
         logger.info("Начинаю анализ нарушений...")
         
@@ -92,7 +94,7 @@ class ViolationAnalyzer:
         else:
             violations = self._analyze_vector(detected_objects, cadastral_parcels)
 
-        if getattr(self.config, "merge_violations_per_parcel", False):
+        if self.config.merge_violations_per_parcel:
             merged = self._merge_violations_one_per_cadastral_parcel(violations)
             logger.info(
                 "Нарушений после union по участку: %s (до объединения: %s)",
@@ -151,7 +153,9 @@ class ViolationAnalyzer:
                         if va < self.config.min_violation_area:
                             continue
 
-                        parcel, dist = self.matcher.match_nearest_unlimited(part, cadastral_parcels)
+                        parcel, binding_type, dist, ratio = self._bind_parcel_with_relaxed_fallback(
+                            part, cadastral_parcels
+                        )
                         if parcel is None:
                             continue
 
@@ -161,9 +165,9 @@ class ViolationAnalyzer:
                                 violation_area=va,
                                 detected_object=obj,
                                 parcel=parcel,
-                                binding_type="nearest",
+                                binding_type=binding_type,
                                 binding_distance=float(dist),
-                                intersection_ratio=0.0,
+                                intersection_ratio=float(ratio),
                                 original_object_area=obj.area_sqm,
                             )
                         )
@@ -450,6 +454,11 @@ class ViolationAnalyzer:
                 continue
             merged_geom = unary_union([v.geometry for v in vs])
             if merged_geom.is_empty:
+                logger.warning(
+                    "Union по КН: пустая геометрия (%s фрагм.), оставляю крупнейший фрагмент",
+                    len(vs),
+                )
+                out.append(max(vs, key=lambda x: x.violation_area))
                 continue
             if merged_geom.geom_type == 'GeometryCollection':
                 merged_geom = unary_union(
@@ -459,7 +468,21 @@ class ViolationAnalyzer:
                         if g.geom_type in ('Polygon', 'MultiPolygon') and not g.is_empty
                     ]
                 )
+            if merged_geom.is_empty:
+                logger.warning(
+                    "Union по КН: пустой результат после отбора полигонов (%s фрагм.), "
+                    "оставляю крупнейший фрагмент",
+                    len(vs),
+                )
+                out.append(max(vs, key=lambda x: x.violation_area))
+                continue
             if merged_geom.geom_type not in ('Polygon', 'MultiPolygon'):
+                logger.warning(
+                    "Union по КН: тип %s после merge (%s фрагм.), оставляю крупнейший фрагмент",
+                    merged_geom.geom_type,
+                    len(vs),
+                )
+                out.append(max(vs, key=lambda x: x.violation_area))
                 continue
             area = merged_geom.area
             if area < self.config.min_violation_area:

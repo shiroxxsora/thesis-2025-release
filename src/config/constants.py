@@ -18,9 +18,6 @@ DEFAULT_INTERSECTION_RATIO = 0.1
 DEFAULT_BOUNDARY_BUFFER_M = 3.0
 DEFAULT_MAX_DISTANCE_M = 25.0
 
-# Нарушения: объединять фрагменты одного кадастрового участка (union) в одну запись
-DEFAULT_MERGE_VIOLATIONS_PER_PARCEL = False
-
 # Упрощение геометрии
 DEFAULT_SIMPLIFY_TOLERANCE_M = 0.5
 DEFAULT_CV_EPS_FACTOR = 0.004
@@ -34,7 +31,7 @@ DEFAULT_MAP_FIGURE_SIZE = (22.0, 14.67)
 DEFAULT_MAP_FIGURE_DPI = 350
 
 # Подложка overview: длина длинной стороны растра в px (прореживание). None = без лимита (риск OOM на больших GeoTIFF).
-DEFAULT_MAP_MAX_RASTER_EDGE = 8192
+DEFAULT_MAP_MAX_RASTER_EDGE = 16384
 
 # Форматы экспорта
 SUPPORTED_IMAGE_FORMATS = ['.tif', '.tiff', '.jpg', '.jpeg', '.png']

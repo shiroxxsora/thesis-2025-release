@@ -6,6 +6,7 @@ from osgeo import osr, ogr
 from shapely.geometry import Polygon, MultiPolygon
 from shapely.ops import transform as shapely_transform
 import json
+from shapely.affinity import translate as shapely_translate
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,10 @@ class CoordinateTransformer:
         self.transformation = None
         self.needs_transformation = True
         self.zone_offset = 0.0
+        # Ручной сдвиг по X (используется для МСК tmerc с разными x_0, когда OSR трансформацию
+        # сознательно отключаем, но по bbox видно, что нужен именно зонный сдвиг на ~4e6).
+        self.manual_shift_x = 0.0
+        self._same_projection_zone_mismatch = False
         
         self._setup_transformation(check_zone_offset)
     
@@ -145,8 +150,27 @@ class CoordinateTransformer:
                     )
                     self.needs_transformation = False
                     self.transformation = None
+                    self._same_projection_zone_mismatch = True
         except Exception as e:
             logger.debug(f"Не удалось проверить смещение зон: {e}")
+
+    def enable_manual_zone_shift(self) -> None:
+        """
+        Включает ручной сдвиг по X на величину, компенсирующую разницу x_0.
+
+        Пример: source x_0=4_250_000, target x_0=250_000 => zone_offset=4_000_000,
+        чтобы привести источник к цели, нужно manual_shift_x = -zone_offset.
+        """
+        # Не совмещаем с полноценной OSR-трансформацией: ручной сдвиг — альтернатива ей.
+        if self.needs_transformation and self.transformation is not None:
+            logger.warning("Ручной зонный сдвиг не включён: активна OSR-трансформация.")
+            self.manual_shift_x = 0.0
+            return
+        if abs(self.zone_offset) > 1_000_000:
+            self.manual_shift_x = -float(self.zone_offset)
+            logger.info("Включён ручной зонный сдвиг по X: %s м", self.manual_shift_x)
+        else:
+            self.manual_shift_x = 0.0
     
     def transform_geometry(self, geometry) -> Optional[Polygon]:
         """
@@ -179,13 +203,18 @@ class CoordinateTransformer:
             if geom_clone.GetGeometryType() == ogr.wkbPolygon:
                 shp = shape(json.loads(geom_clone.ExportToJson()))
                 if shp.is_valid and shp.area > 0:
+                    if self.manual_shift_x:
+                        shp = shapely_translate(shp, xoff=self.manual_shift_x, yoff=0.0)
                     return shp
             
             elif geom_clone.GetGeometryType() == ogr.wkbMultiPolygon:
                 # Для MultiPolygon возвращаем самый большой полигон
                 multipolygon = shape(json.loads(geom_clone.ExportToJson()))
                 if isinstance(multipolygon, MultiPolygon) and len(multipolygon.geoms) > 0:
-                    return max(multipolygon.geoms, key=lambda p: p.area)
+                    shp = max(multipolygon.geoms, key=lambda p: p.area)
+                    if self.manual_shift_x:
+                        shp = shapely_translate(shp, xoff=self.manual_shift_x, yoff=0.0)
+                    return shp
         
         except Exception as e:
             logger.warning(f"Ошибка конвертации в Shapely: {e}")
@@ -205,16 +234,23 @@ class CoordinateTransformer:
             Кортеж (x, y) в целевой CRS
         """
         if not self.needs_transformation:
+            if self.manual_shift_x:
+                return (x + self.manual_shift_x, y)
             return (x, y)
         
         if self.transformation is None:
+            if self.manual_shift_x:
+                return (x + self.manual_shift_x, y)
             return (x, y)
         
         try:
             point = ogr.Geometry(ogr.wkbPoint)
             point.AddPoint(x, y, z)
             point.Transform(self.transformation)
-            return (point.GetX(), point.GetY())
+            px, py = (point.GetX(), point.GetY())
+            if self.manual_shift_x:
+                px += self.manual_shift_x
+            return (px, py)
         except Exception as e:
             logger.warning(f"Ошибка трансформации точки: {e}")
             return (x, y)

@@ -33,8 +33,8 @@ _LABEL_BG_DETECTED = "#2e7d32"
 _LABEL_BG_VIOLATION = "#c62828"
 
 # Размеры текста на плашках (pt): при высоком dpi не умножать линейно — иначе перекрывают карту
-_STICKER_FONT_MAIN = 3.4
-_STICKER_FONT_CAD = 2.35
+_STICKER_FONT_MAIN = 4.0
+_STICKER_FONT_CAD = 2.75
 
 
 def _sticker_font_scale(dpi: float) -> float:
@@ -65,12 +65,6 @@ class _StickerPlacer:
         self._bounds = map_bounds
         self._items: List[Tuple[float, float, float, float]] = []
 
-    def _fits(self, cx: float, cy: float, hw: float, hh: float) -> bool:
-        for px, py, phw, phh in self._items:
-            if abs(cx - px) < hw + phw and abs(cy - py) < hh + phh:
-                return False
-        return True
-
     def try_place(
         self,
         cx: float,
@@ -78,44 +72,15 @@ class _StickerPlacer:
         line1: str,
         line2: str,
         clearance: float = 1.08,
-    ) -> Optional[Tuple[float, float]]:
+    ) -> bool:
         hw, hh = _sticker_half_extents_data(self._bounds, line1, line2)
         hw *= clearance
         hh *= clearance
-
-        # 1) пробуем как есть
-        if self._fits(cx, cy, hw, hh):
-            self._items.append((cx, cy, hw, hh))
-            return cx, cy
-
-        # 2) пробуем сдвиги (кольца) вокруг исходной точки
-        minx, miny, maxx, maxy = self._bounds
-        span_x = max(maxx - minx, 1e-9)
-        span_y = max(maxy - miny, 1e-9)
-        step_x = max(hw * 0.85, span_x * 0.006)
-        step_y = max(hh * 0.85, span_y * 0.006)
-
-        for ring in range(1, 8):
-            dx = ring * step_x
-            dy = ring * step_y
-            candidates = [
-                (cx + dx, cy),
-                (cx - dx, cy),
-                (cx, cy + dy),
-                (cx, cy - dy),
-                (cx + dx, cy + dy),
-                (cx + dx, cy - dy),
-                (cx - dx, cy + dy),
-                (cx - dx, cy - dy),
-            ]
-            for nx, ny in candidates:
-                if nx < minx or nx > maxx or ny < miny or ny > maxy:
-                    continue
-                if self._fits(nx, ny, hw, hh):
-                    self._items.append((nx, ny, hw, hh))
-                    return nx, ny
-
-        return None
+        for px, py, phw, phh in self._items:
+            if abs(cx - px) < hw + phw and abs(cy - py) < hh + phh:
+                return False
+        self._items.append((cx, cy, hw, hh))
+        return True
 
 
 def _geometry_label_xy(geom: BaseGeometry) -> Tuple[float, float]:
@@ -164,9 +129,10 @@ def _draw_sticker_label(
     text_color: str = "white",
     font_scale: float = 1.0,
 ) -> None:
-    """Скруглённая плашка: основная строка + кадастр меньшим шрифтом."""
-    fs_m = max(2.5, fontsize_main * font_scale)
-    fs_c = max(2.0, fontsize_cad * font_scale)
+    """Скруглённая плашка: одна или две строки."""
+    # FreeType в matplotlib не поддерживает fontsize < 1.0 pt (иначе спамит логами и всё равно ставит 1).
+    fs_m = max(1.0, float(fontsize_main) * float(font_scale))
+    fs_c = max(1.0, float(fontsize_cad) * float(font_scale))
     ta1 = TextArea(
         line_primary,
         textprops=dict(
@@ -176,11 +142,15 @@ def _draw_sticker_label(
             family="sans-serif",
         ),
     )
-    ta2 = TextArea(
-        line_secondary,
-        textprops=dict(color=text_color, fontsize=fs_c, family="sans-serif"),
-    )
-    pack = VPacker(children=[ta1, ta2], align="center", pad=0, sep=0)
+    if (line_secondary or "").strip():
+        ta2 = TextArea(
+            line_secondary,
+            textprops=dict(color=text_color, fontsize=fs_c, family="sans-serif"),
+        )
+        children = [ta1, ta2]
+    else:
+        children = [ta1]
+    pack = VPacker(children=children, align="center", pad=0, sep=0)
     ab = AnnotationBbox(
         pack,
         (x, y),
@@ -189,7 +159,7 @@ def _draw_sticker_label(
         box_alignment=(0.5, 0.5),
         frameon=True,
         bboxprops=dict(
-            boxstyle="round,pad=0.14",
+            boxstyle="round,pad=0.06",
             facecolor=facecolor,
             edgecolor="black",
             linewidth=0.38,
@@ -294,7 +264,21 @@ def _extent_for_pixel_window(
         for r in (r0, r1):
             xs.append(t[0] + c * t[1] + r * t[2])
             ys.append(t[3] + c * t[4] + r * t[5])
-    return (min(xs), max(xs), min(ys), max(ys))
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+
+    # Убираем видимые "швы" между соседними imshow: слегка перекрываем extent.
+    # Полпикселя по affine обычно достаточно, при этом геометрия не меняется заметно.
+    # (matplotlib может рисовать тонкие зазоры из-за округления в экранных пикселях)
+    px = max(abs(float(t[1])), abs(float(t[2])), abs(float(t[4])), abs(float(t[5])), 0.0)
+    eps = 0.51 * px  # ~полпикселя
+    if eps > 0:
+        min_x -= eps
+        max_x += eps
+        min_y -= eps
+        max_y += eps
+
+    return (min_x, max_x, min_y, max_y)
 
 
 def _accumulate_rgb_minmax_tiled(
@@ -600,7 +584,7 @@ class MapVisualizer:
         
         fig, ax = plt.subplots(figsize=self.figure_size, dpi=self.dpi)
         pt_scale = self.dpi / 200.0
-        sticker_scale = _sticker_font_scale(self.dpi)
+        sticker_scale = _sticker_font_scale(self.dpi) * (1.0 / 3.0)
 
         max_edge = self.max_raster_edge
         if max_edge is None:
@@ -652,7 +636,7 @@ class MapVisualizer:
                 poly = MplPolygon(
                     coords,
                     facecolor='red',
-                    alpha=0.8,
+                    alpha=0.65,
                     edgecolor='darkred',
                     linewidth=1,
                     zorder=4,
@@ -665,22 +649,14 @@ class MapVisualizer:
         ax.set_ylim(bounds[1], bounds[3])
         ax.set_aspect("equal", adjustable="box")
 
-        # Плашки: площадь + КН; без наложений (сначала нарушения, потом объекты; пересечения отбрасываются)
-        placer = _StickerPlacer(bounds)
+        # Плашки: площадь + КН (рисуем все, даже если накладываются)
         matcher = _matcher_default()
-        skipped_v = 0
-        skipped_o = 0
 
         for violation in violations:
             try:
                 x, y = _geometry_label_xy(violation.geometry)
                 l1 = f"{violation.violation_area:.1f} м²"
                 l2 = _cadastral_line(violation.parcel)
-                xy = placer.try_place(x, y, l1, l2)
-                if xy is None:
-                    skipped_v += 1
-                    continue
-                x, y = xy
                 _draw_sticker_label(
                     ax,
                     x,
@@ -700,13 +676,9 @@ class MapVisualizer:
                 if _centroid_under_violation(cx, cy, violations):
                     continue
                 parcel, _, _, _ = matcher.match(obj.geometry, cadastral_parcels)
-                l1 = f"{obj.area_sqm:.1f} м²"
-                l2 = _cadastral_line(parcel)
-                xy = placer.try_place(cx, cy, l1, l2)
-                if xy is None:
-                    skipped_o += 1
-                    continue
-                cx, cy = xy
+                # Зелёные подписи делаем компактнее: только кадастровый номер (без площади)
+                l1 = _cadastral_line(parcel)
+                l2 = ""
                 _draw_sticker_label(
                     ax,
                     cx,
@@ -715,22 +687,15 @@ class MapVisualizer:
                     l2,
                     _LABEL_BG_DETECTED,
                     zorder=19,
-                    font_scale=sticker_scale,
+                    font_scale=sticker_scale * 0.72,
                 )
             except Exception as e:
                 logger.debug("Подпись объекта пропущена: %s", e)
 
-        if skipped_v or skipped_o:
-            logger.info(
-                "Плашки: пропущено из-за пересечений — нарушения: %s, объекты: %s",
-                skipped_v,
-                skipped_o,
-            )
-
         # Настройка
-        title_fs = min(22, round(12 * pt_scale))
-        axis_fs = min(16, round(10 * pt_scale))
-        leg_fs = max(8, round(9 * pt_scale))
+        title_fs = min(24, round(13 * pt_scale))
+        axis_fs = min(18, round(11 * pt_scale))
+        leg_fs = max(9, round(10 * pt_scale))
         ax.set_title(
             f'Анализ нарушений: {len(violations)} нарушений из {len(detected_objects)} объектов',
             fontsize=title_fs,

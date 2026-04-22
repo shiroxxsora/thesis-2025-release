@@ -83,9 +83,27 @@ def present_xy(
     except Exception:
         return x, y
 
+    # Документная схема (как ожидают в отчёте МСК): X_doc = Y_src, Y_doc = 4_000_000 + X_src,
+    # но если X_src уже «в зонной записи» (x_0≈4_250_000), то перед добавкой 4_000_000
+    # снимаем лишние 4_000_000, иначе получится 8_***_***.
+    x0 = None
+    if proj_false_easting_x0 is not None:
+        try:
+            x0 = float(proj_false_easting_x0)
+        except (TypeError, ValueError):
+            x0 = None
+
+    # Приведение X к «малому» виду (около 0..1e6) для формулы 4_000_000 + X_small.
+    x_small = xf
+    if x0 is not None and abs(x0 - MSK_FALSE_EASTING_CANONICAL) < 200_000.0:
+        # Канонический x_0≈4_250_000: easting обычно уже содержит +4_000_000.
+        # Но если easting уже «малый» (например 151k), вычитать нельзя — иначе уйдём в отрицательные.
+        if xf >= 3_000_000.0:
+            x_small = xf - MSK_GRID_OFFSET_M
+
     new_x = yf
-    sign = -1.0 if xf < 0 else 1.0
-    new_y = sign * (4000000.0 + abs(xf))
+    sign = -1.0 if x_small < 0 else 1.0
+    new_y = sign * (MSK_GRID_OFFSET_M + abs(x_small))
     return new_x, new_y
 
 

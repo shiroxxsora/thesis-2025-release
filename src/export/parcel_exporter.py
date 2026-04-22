@@ -3,12 +3,9 @@
 """
 
 import logging
-import os
 import math
 from pathlib import Path
 from typing import Optional, Tuple, Any
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -54,6 +51,7 @@ class ParcelExporter:
         font_path: Optional[str] = None,
         geotiff_path: Optional[str] = None,
         proj_string: Optional[str] = None,
+        merge_violations_per_parcel: bool = True,
     ):
         """
         Args:
@@ -61,6 +59,8 @@ class ParcelExporter:
             font_path: Путь к TTF-шрифту с кириллицей (опционально)
             geotiff_path: Путь к GeoTIFF для подложки (опционально)
             proj_string: PROJ-строка для исходной СК векторов
+            merge_violations_per_parcel: как в анализе — True: на картах один union на КН;
+                False: каждая строка отчёта отдельным полигоном, площадь на подписи = сумма из Excel.
         """
         self.output_dir = Path(output_dir)
         self.report_path = self.output_dir / "report.xlsx"
@@ -77,6 +77,8 @@ class ParcelExporter:
             '+units=m +no_defs'
         )
         
+        self.merge_violations_per_parcel = merge_violations_per_parcel
+
         # Компоненты
         self.pdf_builder = PDFBuilder(font_path=font_path)
         self.background = None
@@ -119,6 +121,24 @@ class ParcelExporter:
         coords_df = frames['coords_df']
         viol_coords_df = frames['viol_coords_df']
         
+        # Если каких-то листов/колонок нет (например кадастра 0), не падаем.
+        if only_with_violations:
+            if 'Ближайший кадастровый номер' not in violations_df.columns:
+                logger.warning(
+                    "report.xlsx не содержит лист/колонку нарушений ('Ближайший кадастровый номер'). "
+                    "Экспорт per_parcel пропущен."
+                )
+                self.per_parcel_dir.mkdir(parents=True, exist_ok=True)
+                return str(self.per_parcel_dir)
+        else:
+            if 'Кадастровый номер' not in cadastral_df.columns:
+                logger.warning(
+                    "report.xlsx не содержит лист/колонку кадастра ('Кадастровый номер'). "
+                    "Экспорт per_parcel пропущен."
+                )
+                self.per_parcel_dir.mkdir(parents=True, exist_ok=True)
+                return str(self.per_parcel_dir)
+
         # Определение списка участков
         if only_with_violations:
             parcel_ids = sorted(set(violations_df['Ближайший кадастровый номер'].dropna().astype(str)))
@@ -134,22 +154,14 @@ class ParcelExporter:
         # Предзагрузка подложки
         self.background = self._load_background()
         
-        # Обработка участков
+        # Обработка участков: последовательно (matplotlib/pyplot не потокобезопасны).
         total = len(parcel_ids)
-        max_workers = max(1, min(4, (os.cpu_count() or 1)))
-        
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(
-                    self._process_one_parcel,
-                    cad_number, idx, total,
-                    cadastral_df, violations_df, coords_df, viol_coords_df,
-                    out_format
-                ): cad_number
-                for idx, cad_number in enumerate(parcel_ids, 1)
-            }
-            for _ in as_completed(futures):
-                pass
+        for idx, cad_number in enumerate(parcel_ids, 1):
+            self._process_one_parcel(
+                cad_number, idx, total,
+                cadastral_df, violations_df, coords_df, viol_coords_df,
+                out_format,
+            )
         
         logger.info(f"Готово. Файлы: {self.per_parcel_dir}")
         return str(self.per_parcel_dir)
@@ -288,6 +300,7 @@ class ParcelExporter:
             map_gen.create_zoom_map(
                 cad_number, cadastral_df, violations_df, viol_coords_df,
                 str(zoom_img_path), self.proj_string,
+                merge_violations_per_parcel=self.merge_violations_per_parcel,
             )
             if zoom_img_path.exists():
                 return str(zoom_img_path)
@@ -307,6 +320,7 @@ class ParcelExporter:
             map_gen.create_overview_map(
                 cad_number, cadastral_df, violations_df, viol_coords_df,
                 str(overview_img_path), self.proj_string,
+                merge_violations_per_parcel=self.merge_violations_per_parcel,
             )
             if overview_img_path.exists():
                 return str(overview_img_path)

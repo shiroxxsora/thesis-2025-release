@@ -40,7 +40,7 @@ class ComprehensiveAnalyzer:
             'detectron_config': "detectron2/configs/COCO-InstanceSegmentation/mask_rcnn_R_101_FPN_3x.yaml",
             'model_weights': "models/pavel-01-07-25/model_final.pth",
             'output_dir': "output/comprehensive",
-            'chunk_size': 5000,
+            'chunk_size': 4960,
             'overlap': 1536,
             'model_input_size': 1024,
             'score_threshold': 0.3,
@@ -50,7 +50,13 @@ class ComprehensiveAnalyzer:
             'cv_eps_factor': 0.004,
             'binding_min_intersection_ratio': 0.1,
             'binding_boundary_buffer_m': 3.0,
-            'binding_max_nearest_distance_m': 25.0
+            'binding_max_nearest_distance_m': 25.0,
+            # True: в Excel и per_parcel одна геометрия на ЗУ (union фрагментов по привязке к кадастру)
+            'merge_violations_per_parcel': True,
+
+            # Резкость подложки карты: чем выше, тем больше деталей (и расход RAM/время).
+            # None = полный растр (тайловая отрисовка снижает пик памяти, но всё равно может быть тяжело).
+            'map_max_raster_edge': None,
         }
         
         # Результаты в старом формате
@@ -86,10 +92,13 @@ class ComprehensiveAnalyzer:
         new_config.binding_min_intersection_ratio = self.config['binding_min_intersection_ratio']
         new_config.binding_boundary_buffer_m = self.config['binding_boundary_buffer_m']
         new_config.binding_max_nearest_distance_m = self.config['binding_max_nearest_distance_m']
+        new_config.merge_violations_per_parcel = bool(
+            self.config.get('merge_violations_per_parcel', True)
+        )
 
         new_config.map_figure_size = DEFAULT_MAP_FIGURE_SIZE
         new_config.map_figure_dpi = DEFAULT_MAP_FIGURE_DPI
-        # map_max_raster_edge — из AnalysisConfig (по умолчанию ~8192 px; None = полный растр, риск OOM)
+        new_config.map_max_raster_edge = self.config.get('map_max_raster_edge', new_config.map_max_raster_edge)
 
         self._analyzer = RefactoredAnalyzer(new_config)
         
