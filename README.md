@@ -32,14 +32,14 @@ thesis-2025-release/
   │   │   └── coordinate_presenter.py # Утилиты координат
   │   └── utils/                    # Утилиты
   │
-  ├── comprehensive_analysis.py     # Старый монолитный код (legacy)
-  ├── comprehensive_analysis_NEW.py # Обёртка для нового кода
+  ├── comprehensive_analysis_old.py # Старый монолитный код (legacy)
+  ├── comprehensive_analysis.py    # Обёртка для нового кода
   ├── per_parcel_export.py         # Старый монолитный экспорт (legacy)
   ├── per_parcel_export_NEW.py     # Обёртка для нового модульного экспорта
   │
   ├── geotiff_processor.py         # Основной скрипт для инференса
   ├── geotiff_to_shp.py            # Основной скрипт для инференса и экспорта в shp file
-  ├── fine_tuning_280625.py         # Скрипт для дообучения
+  ├── fine_tuning_280625.py        # Скрипт для дообучения
   ├── finetune_model.py            # Базовый скрипт дообучения
   ├── train_model.py               # Полный скрипт обучения с нуля
   │
@@ -106,10 +106,10 @@ python -c "import rasterio, geopandas; print('Геопакеты установ�
 
 ### 🚀 Комплексный анализ (НОВАЯ модульная версия - РЕКОМЕНДУЕТСЯ)
 
-**Основной скрипт:** `comprehensive_analysis_NEW.py`
+**Основной скрипт:** `comprehensive_analysis.py`
 
 ```bash
-python comprehensive_analysis_NEW.py
+python comprehensive_analysis.py
 ```
 
 **Что делает:**
@@ -146,10 +146,10 @@ python comprehensive_analysis_NEW.py
 
 ```bash
 # Используя новую модульную версию (рекомендуется)
-python per_parcel_export_NEW.py
+python per_parcel_export.py
 
 # Или старую монолитную версию (для совместимости)
-python per_parcel_export.py
+python per_parcel_export_old.py
 ```
 
 **Параметры:**
