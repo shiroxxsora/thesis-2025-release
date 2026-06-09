@@ -1,5 +1,16 @@
 /comprehensive_output
 /detectron2
-/__pycache__
+__pycache__/
 
 /output
+/output_*/
+output.zip
+*.zip
+
+/geotiffs/*.tiff
+/geotiffs/*.tif
+/geotiffs/tiffs_with_prj_and_tfw/
+
+.cursor/
+run_batch_tiffs.py
+thesis-2025-release-broken/
