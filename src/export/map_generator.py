@@ -61,8 +61,17 @@ def _same_tmerc_false_easting_mismatch(src_crs: "pyproj.CRS", dest_crs: "pyproj.
     и WKT уже в одной метрической сетке геотрансформа — pyproj-переход даст сдвиг ~4 млн м.
     """
     try:
-        pa = _proj4_tokens(src_crs.to_proj4())
-        pb = _proj4_tokens(dest_crs.to_proj4())
+        # pyproj предупреждает при to_proj4() для некоторых CRS-представлений (BOUNDCRS и т.п.).
+        # Здесь нам нужны только базовые параметры tmerc (+lat_0/+lon_0/+x_0), поэтому
+        # подавляем этот warning локально, чтобы не зашумлять пакетный экспорт.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="You will likely lose important projection information when converting to a PROJ string.*",
+                category=UserWarning,
+            )
+            pa = _proj4_tokens(src_crs.to_proj4())
+            pb = _proj4_tokens(dest_crs.to_proj4())
         if pa.get("+proj") != "tmerc" or pb.get("+proj") != "tmerc":
             return False
         for key in ("+lat_0", "+lon_0"):
@@ -137,10 +146,11 @@ class MapGenerator:
         # Перепроецирование
         project = self._setup_projection(proj_string)
         plot_geoms: List = []
+        plot_parcel_geom = parcel_geom
         if project:
             try:
-                if parcel_geom:
-                    parcel_geom = transform(project, parcel_geom)
+                if plot_parcel_geom:
+                    plot_parcel_geom = transform(project, plot_parcel_geom)
                 if merge_violations_per_parcel:
                     merged = geoms[0] if len(geoms) == 1 else unary_union(geoms)
                     plot_geoms = [transform(project, merged)]
@@ -155,12 +165,25 @@ class MapGenerator:
             else:
                 plot_geoms = list(geoms)
 
+        # Если после перепроекции участок ушёл из области подложки — откатываемся в исходные координаты.
+        if project and not self._is_geometry_near_background(plot_parcel_geom):
+            logger.warning(
+                "Zoom-карта: после перепроекции геометрия вне области подложки; "
+                "использую исходные координаты без pyproj-трансформации."
+            )
+            project = None
+            plot_parcel_geom = parcel_geom
+            if merge_violations_per_parcel:
+                plot_geoms = [geoms[0] if len(geoms) == 1 else unary_union(geoms)]
+            else:
+                plot_geoms = list(geoms)
+
         # Подложка
         self._draw_background(ax)
 
         # Контур участка
-        if parcel_geom is not None and not parcel_geom.is_empty:
-            self._plot_shapely(ax, parcel_geom, facecolor='none', edgecolor='blue', linewidth=0.8, alpha=0.9)
+        if plot_parcel_geom is not None and not plot_parcel_geom.is_empty:
+            self._plot_shapely(ax, plot_parcel_geom, facecolor='none', edgecolor='blue', linewidth=0.8, alpha=0.9)
 
         # Нарушения: union на КН или по строкам отчёта
         for g in plot_geoms:
@@ -178,7 +201,7 @@ class MapGenerator:
         )
 
         # Масштаб
-        self._set_zoom_scale(ax, [x for x in plot_geoms if x is not None and not x.is_empty], parcel_geom)
+        self._set_zoom_scale(ax, [x for x in plot_geoms if x is not None and not x.is_empty], plot_parcel_geom)
 
         ax.set_aspect('equal', adjustable='box')
         ax.axis('off')
@@ -254,9 +277,11 @@ class MapGenerator:
         # Перепроецирование и список геометрий для отрисовки
         project = self._setup_projection(proj_string)
         plot_geoms: List = []
+        plot_parcel_geom = parcel_geom
+        plot_cadastral_info = all_cadastral_info
         if project:
             try:
-                parcel_geom = transform(project, parcel_geom)
+                plot_parcel_geom = transform(project, plot_parcel_geom)
                 if geoms:
                     if merge_violations_per_parcel:
                         u = geoms[0] if len(geoms) == 1 else unary_union(geoms)
@@ -266,8 +291,11 @@ class MapGenerator:
                         plot_geoms = [
                             transform(project, g) for g in geoms if g is not None and not g.is_empty
                         ]
+                plot_cadastral_info = []
                 for info in all_cadastral_info:
-                    info['geom'] = transform(project, info['geom'])
+                    ni = dict(info)
+                    ni['geom'] = transform(project, info['geom'])
+                    plot_cadastral_info.append(ni)
             except Exception as e:
                 logger.exception("Обзорная карта: ошибка перепроецирования: %s", e)
                 return
@@ -279,11 +307,27 @@ class MapGenerator:
                 else:
                     plot_geoms = [g for g in geoms if g is not None and not g.is_empty]
         
+        # Если после перепроекции участок ушёл из области подложки — откатываемся в исходные координаты.
+        if project and not self._is_geometry_near_background(plot_parcel_geom):
+            logger.warning(
+                "Overview-карта: после перепроекции геометрия вне области подложки; "
+                "использую исходные координаты без pyproj-трансформации."
+            )
+            project = None
+            plot_parcel_geom = parcel_geom
+            plot_cadastral_info = all_cadastral_info
+            if geoms:
+                if merge_violations_per_parcel:
+                    u = geoms[0] if len(geoms) == 1 else unary_union(geoms)
+                    plot_geoms = [u] if not u.is_empty else []
+                else:
+                    plot_geoms = [g for g in geoms if g is not None and not g.is_empty]
+        
         # Подложка
         self._draw_background(ax)
         
         # Все участки
-        for info in all_cadastral_info:
+        for info in plot_cadastral_info:
             if info['is_main']:
                 self._plot_shapely(ax, info['geom'], facecolor='lightblue', edgecolor='blue', linewidth=2.0, alpha=0.4)
             else:
@@ -298,12 +342,18 @@ class MapGenerator:
         else:
             total_violation_area = 0.0
         
-        centroid = parcel_geom.centroid
+        # Большую сводку участка фиксируем в углу осей, чтобы не перекрывала геометрию/точки.
         ax.text(
-            centroid.x, centroid.y, 
+            0.03,
+            0.05,
             f"КН: {cadastral_number}\nПлощадь участка: {cadastral_area:.2f} м²\nПлощадь нарушений: {total_violation_area:.2f} м²",
-            fontsize=8, color='blue', ha='center', va='center',
-            bbox=dict(boxstyle='round,pad=0.5', facecolor='white', edgecolor='blue', alpha=0.9)
+            transform=ax.transAxes,
+            fontsize=8.5,
+            color='blue',
+            ha='left',
+            va='bottom',
+            bbox=dict(boxstyle='round,pad=0.35', facecolor='white', edgecolor='blue', alpha=0.88),
+            zorder=12,
         )
         
         for g in plot_geoms:
@@ -318,10 +368,10 @@ class MapGenerator:
         )
         
         # Масштаб
-        self._set_overview_scale(ax, all_cadastral_info, plot_geoms)
+        self._set_overview_scale(ax, plot_cadastral_info, plot_geoms)
         
         ax.set_aspect('equal', adjustable='box')
-        ax.set_title(f'Обзорная карта участка {cadastral_number}', fontsize=10, weight='bold')
+        ax.set_title(f'Обзорная карта участка {cadastral_number}', fontsize=12, weight='bold')
         ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
         
         # Сохранение
@@ -380,11 +430,35 @@ class MapGenerator:
             if bg_img is not None:
                 if bg_extent is not None:
                     left, right, bottom, top = bg_extent
-                    ax.imshow(bg_img, extent=[left, right, bottom, top], alpha=0.8)
+                    ax.imshow(
+                        bg_img,
+                        extent=[left, right, bottom, top],
+                        alpha=0.85,
+                        interpolation='nearest',
+                        zorder=0,
+                    )
                 else:
-                    ax.imshow(bg_img)
+                    ax.imshow(bg_img, interpolation='nearest', zorder=0)
         except Exception:
             pass
+
+    def _is_geometry_near_background(self, geom, tolerance_ratio: float = 0.02) -> bool:
+        """Проверяет, пересекается ли геометрия с extent подложки (с небольшим допуском)."""
+        if geom is None or geom.is_empty or self.background is None:
+            return True
+        try:
+            _, bg_extent, _ = self.background
+            if bg_extent is None:
+                return True
+            left, right, bottom, top = bg_extent
+            bg_box = box(left, bottom, right, top)
+            if bg_box.is_empty:
+                return True
+            span = max(right - left, top - bottom, 1.0)
+            tol = span * float(max(0.0, tolerance_ratio))
+            return bool(geom.intersects(bg_box.buffer(tol)))
+        except Exception:
+            return True
     
     def _draw_centroids(self, ax, violations_df: pd.DataFrame, project):
         """Рисует центроиды нарушений."""
@@ -406,29 +480,24 @@ class MapGenerator:
         self, ax, cadastral_number: str, violations_df: pd.DataFrame,
         viol_coords_df: pd.DataFrame, project,
     ):
-        """Рисует нумерованные точки нарушений по данным из отчёта (без доп. прореживания)."""
+        """Рисует нумерованные точки нарушений по WKT геометрии (независимо от формата координат Excel)."""
         vs_all = violations_df[violations_df['Ближайший кадастровый номер'] == cadastral_number]
-        if vs_all.empty or viol_coords_df.empty or '№ нарушения' not in viol_coords_df.columns:
+        if vs_all.empty or 'WKT геометрии' not in vs_all.columns:
             return
         
         try:
             vs = vs_all.reset_index(drop=True)
             for local_idx, (idx_row, row_v) in enumerate(vs.iterrows(), 1):
-                global_v_num = row_v.get('№ нарушения', idx_row + 1)
                 try:
-                    global_v_num = int(global_v_num)
+                    geom = shapely_wkt.loads(str(row_v.get('WKT геометрии', '')))
                 except Exception:
-                    global_v_num = idx_row + 1
-                
-                sub = viol_coords_df[viol_coords_df['№ нарушения'] == global_v_num].copy()
-                if sub.empty:
                     continue
-                
-                sub.sort_values(by='Номер точки', inplace=True)
-                pts = list(zip(
-                    pd.to_numeric(sub['X'], errors='coerce').astype(float),
-                    pd.to_numeric(sub['Y'], errors='coerce').astype(float)
-                ))
+                if geom is None or geom.is_empty:
+                    continue
+                g = geom if geom.geom_type == 'Polygon' else (list(geom.geoms)[0] if geom.geom_type == 'MultiPolygon' and len(geom.geoms) > 0 else None)
+                if g is None or g.is_empty:
+                    continue
+                pts = list(g.exterior.coords)
                 
                 if project and pts:
                     try:
@@ -442,8 +511,8 @@ class MapGenerator:
                 for i, (x, y) in enumerate(pts, 1):
                     ax.plot([x], [y], marker='o', markersize=2, color='darkred')
                     ax.text(
-                        x, y, str(i), fontsize=5, color='darkred', ha='center', va='bottom',
-                        bbox=dict(boxstyle='round,pad=0.1', facecolor='white', edgecolor='none', alpha=0.8)
+                        x, y, str(i), fontsize=8, color='darkred', ha='center', va='bottom',
+                        bbox=dict(boxstyle='round,pad=0.15', facecolor='white', edgecolor='none', alpha=0.85)
                     )
         except Exception:
             pass
@@ -454,27 +523,22 @@ class MapGenerator:
     ):
         """Рисует подписи нарушений на обзорной карте."""
         vs_all = violations_df[violations_df['Ближайший кадастровый номер'] == cadastral_number]
-        if vs_all.empty or viol_coords_df.empty or '№ нарушения' not in viol_coords_df.columns:
+        if vs_all.empty or 'WKT геометрии' not in vs_all.columns:
             return
         
         try:
             vs = vs_all.reset_index(drop=True)
             for local_idx, (idx_row, row_v) in enumerate(vs.iterrows(), 1):
-                global_v_num = row_v.get('№ нарушения', idx_row + 1)
                 try:
-                    global_v_num = int(global_v_num)
+                    geom = shapely_wkt.loads(str(row_v.get('WKT геометрии', '')))
                 except Exception:
-                    global_v_num = idx_row + 1
-                
-                sub = viol_coords_df[viol_coords_df['№ нарушения'] == global_v_num].copy()
-                if sub.empty:
                     continue
-                
-                sub.sort_values(by='Номер точки', inplace=True)
-                pts = list(zip(
-                    pd.to_numeric(sub['X'], errors='coerce').astype(float),
-                    pd.to_numeric(sub['Y'], errors='coerce').astype(float)
-                ))
+                if geom is None or geom.is_empty:
+                    continue
+                g = geom if geom.geom_type == 'Polygon' else (list(geom.geoms)[0] if geom.geom_type == 'MultiPolygon' and len(geom.geoms) > 0 else None)
+                if g is None or g.is_empty:
+                    continue
+                pts = list(g.exterior.coords)
                 
                 if project and pts:
                     try:
@@ -494,16 +558,42 @@ class MapGenerator:
                 if pts:
                     centroid_x = sum(p[0] for p in pts) / len(pts)
                     centroid_y = sum(p[1] for p in pts) / len(pts)
+                    minx = min(p[0] for p in pts)
+                    miny = min(p[1] for p in pts)
+                    maxx = max(p[0] for p in pts)
+                    maxy = max(p[1] for p in pts)
+                    span = max(maxx - minx, maxy - miny, 1.0)
+                    # Для мелких нарушений выносим плашку ненамного наружу, чтобы не закрывать полигон.
+                    # Дистанцию ограничиваем сверху, чтобы плашка не улетала слишком далеко.
+                    ax_minx, ax_maxx = ax.get_xlim()
+                    ax_miny, ax_maxy = ax.get_ylim()
+                    ax_span = max(ax_maxx - ax_minx, ax_maxy - ax_miny, 1.0)
+                    offset = min(max(0.18 * span, 8.0), 0.07 * ax_span)
+                    label_x = centroid_x + offset
+                    label_y = centroid_y + 0.65 * offset
+                    # Небольшой отступ от края осей, чтобы плашка не обрезалась.
+                    pad = 0.01 * ax_span
+                    label_x = min(max(label_x, ax_minx + pad), ax_maxx - pad)
+                    label_y = min(max(label_y, ax_miny + pad), ax_maxy - pad)
                     ax.text(
-                        centroid_x, centroid_y, 
+                        label_x, label_y,
                         f"№{local_idx}\n{violation_area:.1f} м²",
-                        fontsize=7, color='white', ha='center', va='center', weight='bold',
-                        bbox=dict(boxstyle='round,pad=0.3', facecolor='red', edgecolor='darkred', alpha=0.8)
+                        fontsize=8.5, color='white', ha='left', va='bottom', weight='bold',
+                        bbox=dict(boxstyle='round,pad=0.3', facecolor='red', edgecolor='darkred', alpha=0.78),
+                        zorder=9,
+                    )
+                    ax.plot(
+                        [centroid_x, label_x],
+                        [centroid_y, label_y],
+                        color='darkred',
+                        linewidth=0.8,
+                        alpha=0.9,
+                        zorder=8,
                     )
                 
                 for i, (x, y) in enumerate(pts, 1):
-                    ax.plot([x], [y], marker='o', markersize=2.5, color='yellow', markeredgecolor='darkred', markeredgewidth=0.5)
-                    ax.text(x, y, str(i), fontsize=5, color='black', ha='center', va='center', weight='bold')
+                    ax.plot([x], [y], marker='o', markersize=3.2, color='yellow', markeredgecolor='darkred', markeredgewidth=0.6, zorder=10)
+                    ax.text(x, y, str(i), fontsize=7, color='black', ha='center', va='center', weight='bold', zorder=11)
         except Exception:
             pass
     

@@ -2,21 +2,15 @@
 
 import logging
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.offsetbox import AnnotationBbox, TextArea, VPacker
 from matplotlib.patches import Polygon as MplPolygon
-from shapely.geometry import Point
 from shapely.geometry.base import BaseGeometry
 
-from ..analysis.cadastral_matcher import CadastralMatcher
-from ..config.constants import (
-    DEFAULT_BOUNDARY_BUFFER_M,
-    DEFAULT_INTERSECTION_RATIO,
-    DEFAULT_MAX_DISTANCE_M,
-)
+from ..config.constants import DEFAULT_BOUNDARY_BUFFER_M, DEFAULT_INTERSECTION_RATIO, DEFAULT_MAX_DISTANCE_M
 from ..domain.models import DetectedObject, CadastralParcel, Violation, GeoTiffData
 
 logger = logging.getLogger(__name__)
@@ -28,19 +22,24 @@ try:
 except ImportError:
     _PIL_AVAILABLE = False
 
-# Плашки-подписи: цвет под слой (как на карте)
-_LABEL_BG_DETECTED = "#2e7d32"
+# Объекты детекции на карте (заливка + контур; плашка — янтарь, тёмный текст для контраста)
+_DETECTED_FACE_COLOR = "#ffeb3b"
+_DETECTED_EDGE_COLOR = "#e65100"
+_DETECTED_FACE_ALPHA = 0.45
+_LABEL_BG_DETECTED = "#fbc02d"
+_LABEL_TEXT_ON_DETECTED = "#212121"
 _LABEL_BG_VIOLATION = "#c62828"
 
-# Размеры текста на плашках (pt): при высоком dpi не умножать линейно — иначе перекрывают карту
-_STICKER_FONT_MAIN = 4.0
-_STICKER_FONT_CAD = 2.75
+# Базовые размеры плашек (pt); итог = база × _map_label_font_scale(dpi)
+# Пользовательская настройка: делаем плашки заметно меньше, чтобы не перекрывали карту.
+_STICKER_FONT_MAIN = 4.25
+_STICKER_FONT_CAD = 3.5
 
 
-def _sticker_font_scale(dpi: float) -> float:
-    """Слабая зависимость от dpi (в отличие от заголовка), плашки остаются компактными."""
-    t = (dpi / 200.0) ** 0.32
-    return float(min(0.92, max(0.62, t)) * 0.65)
+def _map_label_font_scale(dpi: float) -> float:
+    """Множитель к pt: безопасный диапазон, чтобы при 350 dpi плашки не перекрывали всю карту."""
+    r = float(dpi) / 200.0
+    return float(max(0.58, min(0.88, 0.54 * (r ** 0.2))))
 
 
 def _sticker_half_extents_data(
@@ -53,8 +52,9 @@ def _sticker_half_extents_data(
     span_x = max(maxx - minx, 1e-9)
     span_y = max(maxy - miny, 1e-9)
     nch = max(len(line1), len(line2), 6)
-    hw = span_x * (0.0085 + min(nch, 48) * 0.00042)
-    hh = span_y * 0.0118
+    # Эвристика габаритов плашки в метрах карты: держим согласованной с реальным размером шрифта.
+    hw = span_x * (0.0031 + min(nch, 48) * 0.00016)
+    hh = span_y * 0.0046
     return hw, hh
 
 
@@ -82,31 +82,56 @@ class _StickerPlacer:
         self._items.append((cx, cy, hw, hh))
         return True
 
+    def force_place(
+        self,
+        cx: float,
+        cy: float,
+        line1: str,
+        line2: str,
+        clearance: float = 1.08,
+    ) -> None:
+        """Регистрирует плашку даже при коллизии (fallback-резервирование)."""
+        hw, hh = _sticker_half_extents_data(self._bounds, line1, line2)
+        self._items.append((cx, cy, hw * clearance, hh * clearance))
+
+
+def _resolve_sticker_xy(
+    placer: _StickerPlacer,
+    x0: float,
+    y0: float,
+    line1: str,
+    line2: str,
+    map_bounds: Tuple[float, float, float, float],
+) -> Tuple[float, float]:
+    """Ищет позицию плашки без пересечения с уже размещёнными (спираль в метрах карты)."""
+    if placer.try_place(x0, y0, line1, line2):
+        return x0, y0
+    minx, miny, maxx, maxy = map_bounds
+    span = max(maxx - minx, maxy - miny, 1e-9)
+    step = span * 0.007
+    for k in range(1, 32):
+        ang = k * 2.3999632297286533
+        r = step * float(np.sqrt(k))
+        nx = x0 + r * float(np.cos(ang))
+        ny = y0 + r * float(np.sin(ang))
+        if nx < minx or nx > maxx or ny < miny or ny > maxy:
+            continue
+        if placer.try_place(nx, ny, line1, line2):
+            return nx, ny
+    # Если не нашли свободного места — всё равно резервируем исходную точку,
+    # иначе последующие плашки будут считать её свободной и наложения усилятся.
+    placer.force_place(x0, y0, line1, line2)
+    return x0, y0
+
 
 def _geometry_label_xy(geom: BaseGeometry) -> Tuple[float, float]:
     c = geom.centroid
     return float(c.x), float(c.y)
 
 
-def _centroid_under_violation(x: float, y: float, violations: List[Violation]) -> bool:
-    """True, если точка попадает в полигон нарушения (чтобы не дублировать зелёные подписи)."""
-    pt = Point(x, y)
-    for v in violations:
-        try:
-            g = v.geometry
-            if g.covers(pt) or g.distance(pt) <= 0.08:
-                return True
-        except Exception:
-            continue
-    return False
-
-
-def _matcher_default() -> CadastralMatcher:
-    return CadastralMatcher(
-        min_intersection_ratio=DEFAULT_INTERSECTION_RATIO,
-        boundary_buffer_m=DEFAULT_BOUNDARY_BUFFER_M,
-        max_nearest_distance_m=DEFAULT_MAX_DISTANCE_M,
-    )
+#
+# NOTE: CadastralMatcher / centroid-under-violation were used when labels were drawn per detected object.
+# Now cadastral labels are placed per parcel centroid; keep the constants import for defaults used elsewhere.
 
 
 def _cadastral_line(parcel: Optional[CadastralParcel]) -> str:
@@ -133,24 +158,28 @@ def _draw_sticker_label(
     # FreeType в matplotlib не поддерживает fontsize < 1.0 pt (иначе спамит логами и всё равно ставит 1).
     fs_m = max(1.0, float(fontsize_main) * float(font_scale))
     fs_c = max(1.0, float(fontsize_cad) * float(font_scale))
+    _tp = dict(
+        color=text_color,
+        family="sans-serif",
+        antialiased=True,
+    )
     ta1 = TextArea(
         line_primary,
         textprops=dict(
-            color=text_color,
             fontsize=fs_m,
             fontweight="bold",
-            family="sans-serif",
+            **_tp,
         ),
     )
     if (line_secondary or "").strip():
         ta2 = TextArea(
             line_secondary,
-            textprops=dict(color=text_color, fontsize=fs_c, family="sans-serif"),
+            textprops=dict(fontsize=fs_c, **_tp),
         )
         children = [ta1, ta2]
     else:
         children = [ta1]
-    pack = VPacker(children=children, align="center", pad=0, sep=0)
+    pack = VPacker(children=children, align="center", pad=0, sep=1)
     ab = AnnotationBbox(
         pack,
         (x, y),
@@ -159,13 +188,16 @@ def _draw_sticker_label(
         box_alignment=(0.5, 0.5),
         frameon=True,
         bboxprops=dict(
-            boxstyle="round,pad=0.06",
+            boxstyle="round,pad=0.03",
             facecolor=facecolor,
             edgecolor="black",
-            linewidth=0.38,
+            linewidth=0.35,
         ),
         zorder=zorder,
     )
+    patch = getattr(ab, "patch", None)
+    if patch is not None:
+        patch.set_antialiased(True)
     ax.add_artist(ab)
 
 
@@ -584,7 +616,7 @@ class MapVisualizer:
         
         fig, ax = plt.subplots(figsize=self.figure_size, dpi=self.dpi)
         pt_scale = self.dpi / 200.0
-        sticker_scale = _sticker_font_scale(self.dpi) * (1.0 / 3.0)
+        sticker_scale = _map_label_font_scale(self.dpi)
 
         max_edge = self.max_raster_edge
         if max_edge is None:
@@ -619,10 +651,10 @@ class MapVisualizer:
             coords = list(obj.geometry.exterior.coords)
             poly = MplPolygon(
                 coords,
-                facecolor='green',
-                alpha=0.4,
-                edgecolor='darkgreen',
-                linewidth=0.5,
+                facecolor=_DETECTED_FACE_COLOR,
+                alpha=_DETECTED_FACE_ALPHA,
+                edgecolor=_DETECTED_EDGE_COLOR,
+                linewidth=0.55,
                 zorder=3,
             )
             ax.add_patch(poly)
@@ -649,18 +681,19 @@ class MapVisualizer:
         ax.set_ylim(bounds[1], bounds[3])
         ax.set_aspect("equal", adjustable="box")
 
-        # Плашки: площадь + КН (рисуем все, даже если накладываются)
-        matcher = _matcher_default()
+        # Плашки: смещение при пересечении (_StickerPlacer + спираль)
+        sticker_placer = _StickerPlacer(bounds)
 
         for violation in violations:
             try:
                 x, y = _geometry_label_xy(violation.geometry)
                 l1 = f"{violation.violation_area:.1f} м²"
                 l2 = _cadastral_line(violation.parcel)
+                px, py = _resolve_sticker_xy(sticker_placer, x, y, l1, l2, bounds)
                 _draw_sticker_label(
                     ax,
-                    x,
-                    y,
+                    px,
+                    py,
                     l1,
                     l2,
                     _LABEL_BG_VIOLATION,
@@ -670,24 +703,34 @@ class MapVisualizer:
             except Exception as e:
                 logger.debug("Подпись нарушения пропущена: %s", e)
 
-        for obj in detected_objects:
+        # Подписи кадастра: 1 плашка на 1 КН. Ставим по центроиду участка (так не пропадают,
+        # даже если внутри ЗУ нет детекций/все центроиды попали под нарушение).
+        parcel_labels: Dict[str, Tuple[float, float]] = {}
+        for p in cadastral_parcels:
             try:
-                cx, cy = float(obj.centroid[0]), float(obj.centroid[1])
-                if _centroid_under_violation(cx, cy, violations):
+                cn = _cadastral_line(p)
+                if cn == "—" or cn in parcel_labels:
                     continue
-                parcel, _, _, _ = matcher.match(obj.geometry, cadastral_parcels)
-                # Зелёные подписи делаем компактнее: только кадастровый номер (без площади)
-                l1 = _cadastral_line(parcel)
+                cx, cy = float(p.centroid[0]), float(p.centroid[1])
+                parcel_labels[cn] = (cx, cy)
+            except Exception as e:
+                logger.debug("Подпись кадастра пропущена: %s", e)
+
+        for cn, (cx, cy) in parcel_labels.items():
+            try:
+                l1 = cn
                 l2 = ""
+                px, py = _resolve_sticker_xy(sticker_placer, cx, cy, l1, l2, bounds)
                 _draw_sticker_label(
                     ax,
-                    cx,
-                    cy,
+                    px,
+                    py,
                     l1,
                     l2,
                     _LABEL_BG_DETECTED,
                     zorder=19,
-                    font_scale=sticker_scale * 0.72,
+                    font_scale=sticker_scale,
+                    text_color=_LABEL_TEXT_ON_DETECTED,
                 )
             except Exception as e:
                 logger.debug("Подпись объекта пропущена: %s", e)
@@ -707,7 +750,12 @@ class MapVisualizer:
         # Легенда
         from matplotlib.patches import Patch
         legend_elements = [
-            Patch(facecolor='green', alpha=0.4, edgecolor='darkgreen', label=f'Объекты ({len(detected_objects)})'),
+            Patch(
+                facecolor=_DETECTED_FACE_COLOR,
+                alpha=_DETECTED_FACE_ALPHA,
+                edgecolor=_DETECTED_EDGE_COLOR,
+                label=f'Объекты ({len(detected_objects)})',
+            ),
             Patch(facecolor='none', edgecolor='blue', label=f'Кадастр ({len(cadastral_parcels)})'),
             Patch(facecolor='red', alpha=0.8, edgecolor='darkred', label=f'Нарушения ({len(violations)})')
         ]

@@ -49,6 +49,10 @@ class AnalysisConfig:
     binding_min_intersection_ratio: float = DEFAULT_INTERSECTION_RATIO
     binding_boundary_buffer_m: float = DEFAULT_BOUNDARY_BUFFER_M
     binding_max_nearest_distance_m: float = DEFAULT_MAX_DISTANCE_M
+    # Ручной сдвиг кадастра (м) для файлов, где контуры системно смещены.
+    # Применяется к геометрии кадастра на этапе чтения и влияет на карту, анализ и координаты в отчётах.
+    cadastral_offset_x_m: float = DEFAULT_CADASTRAL_OFFSET_X_M
+    cadastral_offset_y_m: float = DEFAULT_CADASTRAL_OFFSET_Y_M
 
     # Один ряд в Excel / per_parcel на ЗУ: unary_union всех фрагментов с одной привязкой
     merge_violations_per_parcel: bool = True
@@ -68,23 +72,3 @@ class AnalysisConfig:
     def __post_init__(self):
         """Создаёт выходную директорию если её нет."""
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
-
-
-@dataclass
-class VisualizationConfig:
-    """Конфигурация визуализации."""
-    
-    dpi: int = DEFAULT_DPI
-    figure_size: tuple = DEFAULT_FIGURE_SIZE
-    
-    # Цвета
-    cadastral_edge_color: str = 'blue'
-    detected_face_color: str = 'yellow'
-    detected_alpha: float = 0.4
-    violation_face_color: str = 'red'
-    violation_alpha: float = 0.6
-    
-    # Размеры линий
-    cadastral_linewidth: float = 0.8
-    detected_linewidth: float = 0.5
-    violation_linewidth: float = 0.5

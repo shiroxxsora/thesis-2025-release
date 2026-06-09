@@ -14,6 +14,34 @@ MSK_GRID_OFFSET_M = 4_000_000.0
 _NORTHING_ADJUST_MIN = 6_500_000.0
 
 
+def projection_uses_msk_excel_convention(proj4: str) -> bool:
+    """
+    True — применить историческую схему МСК-03/Улан-Удэ в Excel (present_xy: перестановка
+    осей и смещение 4_000_000). False — сцена в WGS/UTM и т.п.: писать (X, Y) как в
+    исходной проекции растра, в метрах, без 4M-схемы.
+
+    Пустой proj4: True (сохраняем прежнее предположение, чтобы не ломать нестандартные
+    поставки, где калибруют вручную).
+    """
+    if not proj4 or not isinstance(proj4, str):
+        return True
+    s = proj4.lower()
+    s_compact = s.replace(" ", "")
+    if "+proj=utm" in s_compact:
+        return False
+    if any(
+        t in s_compact
+        for t in (
+            "+proj=longlat",
+            "+proj=latlong",
+            "+proj=lonlat",
+            "+proj=latlon",
+        )
+    ):
+        return False
+    return True
+
+
 def parse_false_easting_x0_from_proj4(proj4: str) -> Optional[float]:
     """Извлекает +x_0 из PROJ4-строки."""
     if not proj4 or not isinstance(proj4, str):
@@ -64,6 +92,7 @@ def present_xy(
     x: float,
     y: float,
     proj_false_easting_x0: Optional[float] = None,
+    use_msk_coordinate_presentation: bool = True,
 ) -> Tuple[float, float]:
     """
     Трансформирует координаты для представления в документах.
@@ -75,7 +104,14 @@ def present_xy(
         x: Исходная координата X (восток, м)
         y: Исходная координата Y (север, м)
         proj_false_easting_x0: +x_0 из PROJ растра/сцены; None — без сдвига по сетке МСК.
+        use_msk_coordinate_presentation: False — WGS/UTM и др.: (X, Y) в метрах сцены.
     """
+    if not use_msk_coordinate_presentation:
+        try:
+            return (float(x), float(y))
+        except (TypeError, ValueError):
+            return (x, y)  # type: ignore[return-value]
+
     xf, yf = adjust_xy_before_document_present(x, y, proj_false_easting_x0)
     try:
         xf = float(xf)
@@ -110,13 +146,17 @@ def present_xy(
 def present_xy_extrema_from_bounds(
     bounds: Tuple[float, float, float, float],
     proj_false_easting_x0: Optional[float],
+    use_msk_coordinate_presentation: bool = True,
 ) -> Tuple[float, float, float, float]:
     """
     Мин/макс в «документных» осях после present_xy по четырём углам осевого bbox.
     """
     minx, miny, maxx, maxy = bounds
     corners = ((minx, miny), (minx, maxy), (maxx, miny), (maxx, maxy))
-    pxys = [present_xy(a, b, proj_false_easting_x0) for a, b in corners]
+    pxys = [
+        present_xy(a, b, proj_false_easting_x0, use_msk_coordinate_presentation)
+        for a, b in corners
+    ]
     xs = [p[0] for p in pxys]
     ys = [p[1] for p in pxys]
     return (min(xs), min(ys), max(xs), max(ys))

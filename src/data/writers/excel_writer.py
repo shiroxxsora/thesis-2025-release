@@ -12,6 +12,19 @@ from ...export.coordinate_presenter import present_xy, present_xy_extrema_from_b
 
 logger = logging.getLogger(__name__)
 
+try:
+    import pyproj
+    _PYPROJ_AVAILABLE = True
+except Exception:
+    _PYPROJ_AVAILABLE = False
+
+# МСК-03 (Улан-Удэ), "малый" false easting (x_0=250000) для согласованного документного вида:
+# после present_xy получаем ожидаемые координаты порядка X~5xx xxx, Y~4 1xx xxx.
+_DOC_MSK_SCENE_PROJ4 = (
+    "+proj=tmerc +lat_0=0 +lon_0=109.03333333333 +k=1 +x_0=250000 "
+    "+y_0=-5211057.63 +ellps=krass +towgs84=23.57,-140.95,-79.8,0,0.35,0.79,-0.22 "
+    "+units=m +no_defs"
+)
 
 def _violation_coord_rows(geom):
     """Точки контура нарушения: один или несколько полигонов (MultiPolygon)."""
@@ -43,6 +56,9 @@ class ExcelWriter(DataWriter):
         violations: List[Violation],
         path: str,
         proj_false_easting_x0: Optional[float] = None,
+        use_msk_coordinate_presentation: bool = True,
+        source_proj4: Optional[str] = None,
+        force_msk_for_all_inputs: bool = False,
     ) -> None:
         """
         Записывает отчёт в Excel.
@@ -52,9 +68,20 @@ class ExcelWriter(DataWriter):
 
         proj_false_easting_x0: +x_0 из PROJ растра; для МСК с x_0≠4250000 подправляет
         север для колонок в «зонной» записи документов.
+        use_msk_coordinate_presentation: False — UTM/географ. СК: колонки X/Y = метры/градусы
+        в системе сцены без 4M-схемы МСК.
+        source_proj4: PROJ4 исходной сцены/растра (нужен для UTM->МСК в принудительном режиме).
+        force_msk_for_all_inputs: True — всегда выдавать документные МСК-координаты, даже для UTM.
         """
         logger.info(f"Создание Excel отчёта: {path}")
         self._proj_x0 = proj_false_easting_x0
+        self._use_msk_docs = use_msk_coordinate_presentation
+        self._coord_transform = None
+        if force_msk_for_all_inputs:
+            self._use_msk_docs = True
+            # Для формулы present_xy ориентируемся на "малый" x0.
+            self._proj_x0 = 250000.0
+            self._coord_transform = self._build_transform_to_doc_msk(source_proj4)
         try:
             with pd.ExcelWriter(path, engine='openpyxl') as writer:
                 # 1. Сводка
@@ -102,6 +129,48 @@ class ExcelWriter(DataWriter):
                 logger.info(f"Процент нарушений: {(total_violation_area/total_cadastral_area*100):.2f}%")
         finally:
             self._proj_x0 = None
+            self._use_msk_docs = True
+            self._coord_transform = None
+
+    def _build_transform_to_doc_msk(self, source_proj4: Optional[str]):
+        """Создаёт трансформер source->MSK(document scene)."""
+        if not _PYPROJ_AVAILABLE:
+            logger.warning("pyproj недоступен: принудительный МСК-режим работает без преобразования CRS.")
+            return None
+        if not source_proj4:
+            return None
+        try:
+            src = pyproj.CRS.from_proj4(source_proj4)
+            dst = pyproj.CRS.from_proj4(_DOC_MSK_SCENE_PROJ4)
+            if src == dst:
+                return None
+            tr = pyproj.Transformer.from_crs(src, dst, always_xy=True)
+            logger.info("Excel: включено преобразование координат source CRS -> МСК document.")
+            return tr.transform
+        except Exception as e:
+            logger.warning(f"Не удалось включить source->MSK преобразование для Excel: {e}")
+            return None
+
+    def _present(self, x: float, y: float) -> Tuple[float, float]:
+        """Преобразует точку к документному представлению (с опциональным source->MSK)."""
+        xx, yy = x, y
+        if self._coord_transform is not None:
+            try:
+                xx, yy = self._coord_transform(float(x), float(y))
+            except Exception:
+                xx, yy = x, y
+        return present_xy(xx, yy, self._proj_x0, self._use_msk_docs)
+
+    def _present_bounds(self, bounds: Tuple[float, float, float, float]) -> Tuple[float, float, float, float]:
+        """Экстремумы bbox в документных осях с учетом source->MSK при необходимости."""
+        if self._coord_transform is None:
+            return present_xy_extrema_from_bounds(bounds, self._proj_x0, self._use_msk_docs)
+        minx, miny, maxx, maxy = bounds
+        corners = ((minx, miny), (minx, maxy), (maxx, miny), (maxx, maxy))
+        pts = [self._present(x, y) for (x, y) in corners]
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        return (min(xs), min(ys), max(xs), max(ys))
     
     def _write_summary(self, writer, detected, cadastral, violations):
         """Записывает сводку."""
@@ -133,7 +202,7 @@ class ExcelWriter(DataWriter):
         for i, p in enumerate(cadastral_parcels, 1):
             g = p.geometry
             cxy = g.centroid.coords[0]
-            ccx, ccy = present_xy(cxy[0], cxy[1], self._proj_x0)
+            ccx, ccy = self._present(cxy[0], cxy[1])
             row = {
                 '№ п/п': i,
                 'Кадастровый номер': p.cadastral_number,
@@ -146,7 +215,7 @@ class ExcelWriter(DataWriter):
             
             # Bounds: экстремумы по четырём углам bbox после present_xy
             bounds = g.bounds
-            mix, miy, mxx, mxy = present_xy_extrema_from_bounds(bounds, self._proj_x0)
+            mix, miy, mxx, mxy = self._present_bounds(bounds)
             row.update({
                 'Мин X': round(mix, 6),
                 'Мин Y': round(miy, 6),
@@ -157,7 +226,7 @@ class ExcelWriter(DataWriter):
             # Первые 10 точек контура
             coords = list(g.exterior.coords)[:10]
             for j, (x, y) in enumerate(coords, 1):
-                px, py = present_xy(x, y, self._proj_x0)
+                px, py = self._present(x, y)
                 row[f'Точка {j} X'] = round(px, 6)
                 row[f'Точка {j} Y'] = round(py, 6)
             
@@ -178,7 +247,7 @@ class ExcelWriter(DataWriter):
         for i, v in enumerate(violations, 1):
             g = v.geometry
             cxy = v.centroid if v.centroid is not None else g.centroid.coords[0]
-            vcx, vcy = present_xy(cxy[0], cxy[1], self._proj_x0)
+            vcx, vcy = self._present(cxy[0], cxy[1])
             row = {
                 '№ нарушения': i,
                 'Площадь нарушения, м²': round(v.violation_area, 2),
@@ -191,7 +260,7 @@ class ExcelWriter(DataWriter):
             }
             
             bounds = g.bounds
-            mix, miy, mxx, mxy = present_xy_extrema_from_bounds(bounds, self._proj_x0)
+            mix, miy, mxx, mxy = self._present_bounds(bounds)
             row.update({
                 'Мин X': round(mix, 6),
                 'Мин Y': round(miy, 6),
@@ -203,7 +272,7 @@ class ExcelWriter(DataWriter):
             try:
                 coords = _violation_coord_rows(g)[:10]
                 for j, (x, y) in enumerate(coords, 1):
-                    px, py = present_xy(x, y, self._proj_x0)
+                    px, py = self._present(x, y)
                     row[f'Точка {j} X'] = round(px, 6)
                     row[f'Точка {j} Y'] = round(py, 6)
             except Exception:
@@ -226,7 +295,7 @@ class ExcelWriter(DataWriter):
         for p in cadastral_parcels:
             coords = list(p.geometry.exterior.coords)
             for i, (x, y) in enumerate(coords, 1):
-                px, py = present_xy(x, y, self._proj_x0)
+                px, py = self._present(x, y)
                 data.append({
                     'Кадастровый номер': p.cadastral_number,
                     'Номер точки': i,
@@ -247,7 +316,7 @@ class ExcelWriter(DataWriter):
             try:
                 coords = _violation_coord_rows(v.geometry)
                 for j, (x, y) in enumerate(coords, 1):
-                    px, py = present_xy(x, y, self._proj_x0)
+                    px, py = self._present(x, y)
                     data.append({
                         '№ нарушения': i,
                         'Номер точки': j,

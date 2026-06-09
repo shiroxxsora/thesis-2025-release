@@ -18,7 +18,9 @@ from .utils.document_geometry import (
     cadastral_parcels_for_maps_and_documents,
     violations_for_maps_and_documents,
 )
-from .export.coordinate_presenter import parse_false_easting_x0_from_proj4
+from .export.coordinate_presenter import (
+    parse_false_easting_x0_from_proj4,
+)
 
 
 class ComprehensiveAnalyzer:
@@ -97,6 +99,10 @@ class ComprehensiveAnalyzer:
         # 1. Загрузка GeoTIFF
         self.logger.info("\n[1/9] Загрузка GeoTIFF...")
         geotiff_data = self.geotiff_reader.read(self.config.input_geotiff)
+        # Для per_parcel используем тот же GeoTIFF, что и в текущем анализе.
+        # Иначе exporter может взять дефолтный путь (например geotiffs/input.tiff) и остаться без подложки.
+        self.parcel_exporter.geotiff_path = str(Path(self.config.input_geotiff).resolve())
+        self.parcel_exporter.proj_string = geotiff_data.proj4_projection or self.parcel_exporter.proj_string
         
         # 2. Обнаружение объектов
         self.logger.info("\n[2/9] Обнаружение объектов нейросетью...")
@@ -111,7 +117,9 @@ class ComprehensiveAnalyzer:
         cadastral_parcels = self.cadastral_reader.read(
             self.config.cadastral_data,
             target_crs=geotiff_data.crs,
-            target_bounds=geotiff_data.bounds
+            target_bounds=geotiff_data.bounds,
+            manual_offset_x_m=self.config.cadastral_offset_x_m,
+            manual_offset_y_m=self.config.cadastral_offset_y_m,
         )
         
         # 5. Анализ нарушений
@@ -209,16 +217,22 @@ class ComprehensiveAnalyzer:
             crs=geotiff_data.crs
         )
         
-        # Excel: те же упрощённые контуры, что на глобальной карте и в per_parcel
-        doc_x0 = parse_false_easting_x0_from_proj4(
-            geotiff_data.proj4_projection or ""
-        )
+        # Excel: принудительно используем документное МСК-представление для всех входных TIFF.
+        proj4 = geotiff_data.proj4_projection or ""
+        msk_excel = True
+        doc_x0 = parse_false_easting_x0_from_proj4(proj4)
+        if doc_x0 is None:
+            # Для UTM и иных CRS без +x_0 в PROJ — работаем через "малый" МСК.
+            doc_x0 = 250000.0
         self.excel_writer.write(
             detected_objects,
             cadastral_docs,
             violations_docs,
             str(output_dir / 'report.xlsx'),
             proj_false_easting_x0=doc_x0,
+            use_msk_coordinate_presentation=msk_excel,
+            source_proj4=proj4,
+            force_msk_for_all_inputs=True,
         )
         
         # JSON

@@ -168,68 +168,110 @@ class ParcelExporter:
     
     def _load_background(self) -> Optional[Tuple[Any, Optional[Tuple[float, float, float, float]], Any]]:
         """Загружает фоновое изображение (GeoTIFF) один раз."""
-        if not self.geotiff_path or not Path(self.geotiff_path).exists():
-            logger.info("GeoTIFF подложка не указана или не найдена")
+        if not self.geotiff_path:
+            logger.info("GeoTIFF подложка не указана")
+            return None
+        geotiff_path = Path(self.geotiff_path)
+        if not geotiff_path.exists():
+            logger.warning(f"GeoTIFF подложка не найдена: {geotiff_path.resolve()}")
             return None
         
-        if not str(self.geotiff_path).lower().endswith(('.tif', '.tiff')):
+        if not str(geotiff_path).lower().endswith(('.tif', '.tiff')):
             logger.info("Подложка не является GeoTIFF, пропускаем")
             return None
-        
-        if not GDAL_AVAILABLE:
-            logger.warning("GDAL не доступен, подложка не будет загружена")
-            return None
-        
-        try:
-            logger.info(f"Загрузка GeoTIFF подложки: {self.geotiff_path}")
-            ds = gdal.Open(str(self.geotiff_path))
-            if ds is None:
-                raise RuntimeError(f"Не удалось открыть GeoTIFF: {self.geotiff_path}")
-            
-            arr = ds.ReadAsArray()
-            if arr.ndim == 2:
-                arr = arr[None, ...]
-            
-            height = ds.RasterYSize
-            width = ds.RasterXSize
-            gt = ds.GetGeoTransform()
-            left = gt[0]
-            top = gt[3]
-            right = gt[0] + width * gt[1]
-            bottom = gt[3] + height * gt[5]
-            proj_wkt = ds.GetProjection()
-            
-            # Уменьшение размера для производительности
-            if max(height, width) > 3000:
-                step = max(1, math.ceil(max(height, width) / 3000))
-                arr = arr[:, ::step, ::step]
-                height = arr.shape[1]
-                width = arr.shape[2]
-            
-            # Нормализация в RGB
-            if arr.shape[0] >= 3:
-                rgb = arr[:3].astype('float64')
-                rgb = (rgb - rgb.min()) / max(1e-9, (rgb.max() - rgb.min()))
-                rgb = rgb.transpose(1, 2, 0)
-                img_bg = rgb
-            else:
-                gray = arr[0].astype('float64')
-                gray = (gray - gray.min()) / max(1e-9, (gray.max() - gray.min()))
-                img_bg = gray
-            
-            # CRS подложки
-            dest_crs = None
-            if PYPROJ_AVAILABLE and proj_wkt:
-                try:
-                    dest_crs = pyproj.CRS.from_wkt(proj_wkt)
-                except Exception:
+
+        logger.info(f"Загрузка подложки для per_parcel: {geotiff_path.resolve()}")
+
+        # 1) Основной путь: GDAL
+        if GDAL_AVAILABLE:
+            try:
+                logger.info("Подложка: пробую GDAL")
+                ds = gdal.Open(str(geotiff_path))
+                if ds is not None:
+                    arr = ds.ReadAsArray()
+                    if arr.ndim == 2:
+                        arr = arr[None, ...]
+
+                    height = ds.RasterYSize
+                    width = ds.RasterXSize
+                    gt = ds.GetGeoTransform()
+                    left = gt[0]
+                    top = gt[3]
+                    right = gt[0] + width * gt[1]
+                    bottom = gt[3] + height * gt[5]
+                    proj_wkt = ds.GetProjection()
+
+                    # Уменьшение размера для производительности
+                    if max(height, width) > 3000:
+                        step = max(1, math.ceil(max(height, width) / 3000))
+                        arr = arr[:, ::step, ::step]
+                        height = arr.shape[1]
+                        width = arr.shape[2]
+
+                    # Нормализация в RGB
+                    if arr.shape[0] >= 3:
+                        rgb = arr[:3].astype('float64')
+                        rgb = (rgb - rgb.min()) / max(1e-9, (rgb.max() - rgb.min()))
+                        img_bg = rgb.transpose(1, 2, 0)
+                    else:
+                        gray = arr[0].astype('float64')
+                        gray = (gray - gray.min()) / max(1e-9, (gray.max() - gray.min()))
+                        img_bg = gray
+
+                    # CRS подложки
                     dest_crs = None
-            
-            logger.info(f"GeoTIFF загружен: {width}x{height}, CRS: {dest_crs}")
-            return (img_bg, (left, right, bottom, top), dest_crs)
-        
+                    if PYPROJ_AVAILABLE and proj_wkt:
+                        try:
+                            dest_crs = pyproj.CRS.from_wkt(proj_wkt)
+                        except Exception:
+                            dest_crs = None
+
+                    logger.info(f"Подложка (GDAL) загружена: {width}x{height}, CRS: {dest_crs}")
+                    return (img_bg, (left, right, bottom, top), dest_crs)
+            except Exception as e:
+                logger.warning(f"GDAL не смог загрузить подложку: {e}")
+        else:
+            logger.warning("GDAL не доступен, пробую fallback через rasterio")
+
+        # 2) Fallback: rasterio (если GDAL-путь не сработал)
+        try:
+            import rasterio
+
+            logger.info("Подложка: пробую rasterio fallback")
+            with rasterio.open(str(geotiff_path)) as src:
+                arr = src.read()
+                if arr.ndim == 2:
+                    arr = arr[None, ...]
+                height, width = int(src.height), int(src.width)
+                b = src.bounds
+                left, bottom, right, top = float(b.left), float(b.bottom), float(b.right), float(b.top)
+
+                if max(height, width) > 3000:
+                    step = max(1, math.ceil(max(height, width) / 3000))
+                    arr = arr[:, ::step, ::step]
+                    height = int(arr.shape[1])
+                    width = int(arr.shape[2])
+
+                if arr.shape[0] >= 3:
+                    rgb = arr[:3].astype('float64')
+                    rgb = (rgb - rgb.min()) / max(1e-9, (rgb.max() - rgb.min()))
+                    img_bg = rgb.transpose(1, 2, 0)
+                else:
+                    gray = arr[0].astype('float64')
+                    gray = (gray - gray.min()) / max(1e-9, (gray.max() - gray.min()))
+                    img_bg = gray
+
+                dest_crs = None
+                if PYPROJ_AVAILABLE and getattr(src, "crs", None) is not None:
+                    try:
+                        dest_crs = pyproj.CRS.from_user_input(src.crs)
+                    except Exception:
+                        dest_crs = None
+
+                logger.info(f"Подложка (rasterio) загружена: {width}x{height}, CRS: {dest_crs}")
+                return (img_bg, (left, right, bottom, top), dest_crs)
         except Exception as e:
-            logger.warning(f"Не удалось загрузить подложку: {e}")
+            logger.warning(f"Не удалось загрузить подложку ни через GDAL, ни через rasterio: {e}")
             return None
     
     def _process_one_parcel(

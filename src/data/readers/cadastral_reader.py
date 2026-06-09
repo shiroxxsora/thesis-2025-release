@@ -4,6 +4,7 @@ import logging
 from typing import List, Optional, Dict, Any
 from osgeo import ogr, osr
 from shapely.geometry import box
+from shapely.affinity import translate as shapely_translate
 
 from .base import DataReader
 from ...domain.models import CadastralParcel
@@ -24,7 +25,9 @@ class CadastralReader(DataReader[List[CadastralParcel]]):
         self,
         path: str,
         target_crs=None,
-        target_bounds: Optional[tuple] = None
+        target_bounds: Optional[tuple] = None,
+        manual_offset_x_m: float = 0.0,
+        manual_offset_y_m: float = 0.0,
     ) -> List[CadastralParcel]:
         """
         Читает кадастровые данные из MIF/MID файла.
@@ -33,6 +36,8 @@ class CadastralReader(DataReader[List[CadastralParcel]]):
             path: Путь к MIF файлу
             target_crs: Целевая система координат (для трансформации)
             target_bounds: Границы области интереса (min_x, min_y, max_x, max_y)
+            manual_offset_x_m: Ручной сдвиг кадастра по X (м)
+            manual_offset_y_m: Ручной сдвиг кадастра по Y (м)
             
         Returns:
             Список кадастровых участков
@@ -110,7 +115,9 @@ class CadastralReader(DataReader[List[CadastralParcel]]):
             cadastral_objects = self._read_features(
                 layer,
                 field_names,
-                target_bbox
+                target_bbox,
+                manual_offset_x_m=manual_offset_x_m,
+                manual_offset_y_m=manual_offset_y_m,
             )
             
             logger.info(
@@ -189,13 +196,24 @@ class CadastralReader(DataReader[List[CadastralParcel]]):
         """
         Создаёт fallback CRS (МСК-03).
         
-        Использует параметры ellps и towgs84 из целевой CRS если возможно.
+        Для цели WGS/UTM не копируем +ellps/+towgs84 с UTM: исходник MIF в Пулково-42,
+        иначе «фиктивный» tmerc с WGS-эллипсоидом даёт неверный перенос кадастра.
+        Для цели tmerc/МСК (как 1..3.tiff) по-прежнему берём хвосты из target, чтобы
+        совпадать с растром.
         """
-        # Извлекаем параметры из целевой CRS
+        # Пулково-42 / МСК-03 по умолчанию (три параметра, как в BOUNDCRS подложек)
         ellps_param = "krass"
-        towgs84_params = ""
-        
-        if target_crs and hasattr(target_crs, 'ExportToProj4'):
+        towgs84_params = "23.57,-140.95,-79.8"
+        target_is_utm = False
+        if target_crs and hasattr(target_crs, "ExportToProj4"):
+            try:
+                tp = target_crs.ExportToProj4() or ""
+                tlow = tp.lower()
+                if "+proj=utm" in tlow:
+                    target_is_utm = True
+            except Exception:
+                pass
+        if not target_is_utm and target_crs and hasattr(target_crs, "ExportToProj4"):
             try:
                 target_proj4 = target_crs.ExportToProj4()
                 parts = dict(
@@ -203,10 +221,19 @@ class CadastralReader(DataReader[List[CadastralParcel]]):
                     for p in target_proj4.split()
                     if "=" in p
                 )
-                ellps_param = parts.get("+ellps", "krass")
-                towgs84_params = parts.get("+towgs84", "")
+                e = (parts.get("+ellps", "") or "krass").lower()
+                if e and e not in ("wgs84", "grs80"):
+                    ellps_param = parts.get("+ellps", "krass")
+                else:
+                    ellps_param = "krass"
+                tw = parts.get("+towgs84", "")
+                if tw:
+                    towgs84_params = tw
             except Exception:
                 pass
+        if target_is_utm:
+            ellps_param = "krass"
+            towgs84_params = "23.57,-140.95,-79.8"
         
         # Создаём PROJ-строку для МСК-03
         proj4_str = (
@@ -231,11 +258,22 @@ class CadastralReader(DataReader[List[CadastralParcel]]):
         self,
         layer,
         field_names: List[str],
-        target_bbox
+        target_bbox,
+        manual_offset_x_m: float = 0.0,
+        manual_offset_y_m: float = 0.0,
     ) -> List[CadastralParcel]:
         """Читает объекты из слоя."""
         cadastral_objects = []
         total_features = 0
+        use_manual_offset = (
+            abs(float(manual_offset_x_m)) > 1e-12 or abs(float(manual_offset_y_m)) > 1e-12
+        )
+        if use_manual_offset:
+            logger.info(
+                "Применяется ручной сдвиг кадастра: dX=%s м, dY=%s м",
+                manual_offset_x_m,
+                manual_offset_y_m,
+            )
         
         # Диагностика координат
         sample_bounds_original = []
@@ -272,6 +310,13 @@ class CadastralReader(DataReader[List[CadastralParcel]]):
             
             if not shapely_geom or shapely_geom.is_empty or shapely_geom.area == 0:
                 continue
+
+            if use_manual_offset:
+                shapely_geom = shapely_translate(
+                    shapely_geom,
+                    xoff=float(manual_offset_x_m),
+                    yoff=float(manual_offset_y_m),
+                )
             
             # Диагностика трансформированных координат
             if len(sample_bounds_transformed) < 5:
